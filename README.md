@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.10-2496ED?style=flat-square" alt="Version 1.2.10">
+  <img src="https://img.shields.io/badge/Release-v1.2.11-2496ED?style=flat-square" alt="Version 1.2.11">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -121,6 +121,15 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 > **设备身份稳定性（issue #18 实测）**：容器里的机器身份是**「容器级」**的——默认 `bridge` 网络下**重启即换**（含 `docker compose restart` 与宿主机重启后自动拉起），任何网络模式下**重建即换**。若你依赖「每台设备每日限领」这类按设备去重的规则，建议用 `network_mode: host`（代价：不能用 `ports:` 映射，容器直接监听目标端口；**切换前请确认目标端口在宿主机上空闲，否则容器会启动失败**），并**避免高频重建**（如每天自动 pull）。注意：**推理 / API 链路不受影响**，它用的是按账号 UID 派生的身份。
 >
 > 该方案已在 **amd64 与 arm64** 两种架构、以及真实官方镜像 + 真实 compose 配置下验证过（issue #18 与我们的独立复现）。
+>
+> **更省的替代（同样只需消掉「重启就换」）**：留在默认 bridge 网络、**固定网卡 MAC**（保住 `ports:` 映射）：
+> ```yaml
+> services:
+>   qoder-proxy:
+>     mac_address: "02:42:ac:11:00:77"
+>     ports: ["8790:8790"]
+> ```
+> 实测依据（issue #18 的补充实验）：bridge 下容器停止会重建 veth、MAC 随之改变，而身份同时依赖「每容器独有的量」与「网卡 MAC」——固定 MAC 即可让 `stop/start` 后身份逐字节不变（**注意：重建容器仍会换**，那一类由「每容器独有的量」决定，compose 层盖不住）。
 
 ---
 
@@ -383,6 +392,32 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.11
+
+**✨ 新增功能**：无
+
+**🐛 问题修复**：无
+
+**🎨 体验优化**：无
+
+**⚠️ 其他变更**
+
+**文档（issue #18 的补充实验：驱动量定位）**
+- Docker 部署段落的「设备身份稳定性」提示现在**并列两条路**：
+  1. `network_mode: host`（彻底共享宿主网络栈）；
+  2. **`mac_address` 固定网卡 MAC + 保留 `ports:` 映射**——只消掉「重启就换」这一类，代价更小：
+     ```yaml
+     services:
+       qoder-proxy:
+         mac_address: "02:42:ac:11:00:77"
+         ports: ["8790:8790"]
+     ```
+- 附上机制解释（两输入模型）：容器身份取决于「**每容器独有的量**」与「**容器网卡 MAC**」——bridge 下停止会重建 veth、MAC 随之改变，故固定 MAC 即可让 `stop/start` 后身份稳定；**重建容器仍会换**（由「每容器独有的量」决定，compose 层无法覆盖）。
+
+**验证**
+- 独立复现三项关键实验：**共享 netns 的容器身份仍不同**（排除 netns）、**不固定 MAC 时身份随 MAC 同步变化**、**固定 MAC 后两次 stop/start 逐字节不变**；
+- 额外验证 **compose 的 `mac_address:` 服务键**在 restart 后同样稳定，且在 **Docker Desktop / WSL2** 上同样生效（原报告来自 fnOS / Docker 28）。
 
 ### v1.2.10
 
