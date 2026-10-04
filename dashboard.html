@@ -1559,6 +1559,87 @@ async function toggleScheduler(btn){
   }
 }
 
+// 下次可签到时间：优先后端已格式化好的 UTC+8 note；缺失时用 epoch 秒兜底换算，
+// 读数一律走 getUTC*，避免受浏览器本地时区影响。
+function fmtNextCheckin(x){
+  if(x.next_available_note) return String(x.next_available_note);
+  const sec = Number(x.next_available_at || 0);
+  if(!sec) return '';
+  const d = new Date(sec * 1000 + 8 * 3600 * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getUTCMonth() + 1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes()) + '（UTC+8）';
+}
+
+// 旧版 HTTP 响应没有结论字段，只有 logs 数组；其中带固定前缀的行才是结论
+// （✓ 领取成功 / ⚠ 同人已领取 / — 状态说明 / ! 查询失败 / ⏳ 名额发完 / 🔒 需做任务），
+// 而首行「开始为账号…」与末行「  当前额度余额: N」都不是结论——直接取 logs 末行会拿到余额行。
+// 这里挑第一条结论行，并剥掉「标记 + [账号]」前缀，交给上层当文案。
+const CHECKIN_PRIMARY_RE = /^\s*(?:[✓⚠!—])/;   // 主结论：领取成功 / 同人已领 / 状态说明 / 查询失败
+const CHECKIN_AUX_RE = /^\s*(?:⏳|🔒)/;         // 附带说明：名额已发完 / 需先做新手任务
+const CHECKIN_PREFIX_RE = /^\s*(?:[✓⚠!—⏳]|🔒)\s*(?:\[[^\]]*\]\s*)?/;
+const checkinStripLine = s => s.replace(CHECKIN_PREFIX_RE, '').trim();
+function checkinLogLine(x){
+  const logs = (Array.isArray(x.logs) ? x.logs : []).filter(s => typeof s === 'string' && s.trim());
+  const pick = re => { const hit = logs.find(s => re.test(s)); return hit ? checkinStripLine(hit) : ''; };
+  const tail = logs.slice().reverse().find(s => !/^\s*开始为账号/.test(s) && !/当前额度余额/.test(s));
+  return pick(CHECKIN_PRIMARY_RE) || pick(CHECKIN_AUX_RE) || (tail ? tail.trim() : '');
+}
+// 附带说明（如「今日名额已发完，次日 10:00 后自动重试」）：旧后端没有 message，靠它解释「为什么没到账」
+function checkinAuxNote(x){
+  const logs = (Array.isArray(x.logs) ? x.logs : []).filter(s => typeof s === 'string' && s.trim());
+  const hit = logs.find(s => CHECKIN_AUX_RE.test(s));
+  return hit ? checkinStripLine(hit) : '';
+}
+
+// 单账号签到结论：后端 ok 只代表「这次请求没报错」，是否真的到账必须看 claimed / earned_credit。
+// 三类分开渲染，绝不把「已领取」「暂无可领」写成「签到成功」。
+function checkinOutcome(x){
+  const name = x.nickname || String(x.uid || '').slice(0, 6) || '账号';
+  // 结论文案优先级：新后端 message → 旧后端 logs 结论行 → 旧 msg（余额行不当作结论）→ 兜底合成
+  const legacyMsg = (x.msg && !/当前额度余额/.test(String(x.msg))) ? String(x.msg).trim() : '';
+  const detail = x.message || checkinLogLine(x) || legacyMsg;
+  if(x.ok === false){
+    return { state: 'failed', name: name, text: name + ': ' + (x.error || detail || '失败') };
+  }
+  const raw = x.claimed;
+  const claimedList = (Array.isArray(raw) ? raw : (typeof raw === 'string' ? [raw] : []))
+    .filter(v => typeof v === 'string' && v);
+  const earned = Number(x.earned_credit || 0);
+  if(claimedList.length || raw === true || earned > 0){
+    const text = detail || ('领取成功' + (earned > 0 ? ' +' + earned + ' 积分' : '') +
+      (claimedList.length ? '（' + claimedList.join('、') + '）' : ''));
+    return { state: 'claimed', name: name, text: name + ': ' + text };
+  }
+  const next = fmtNextCheckin(x);
+  const aux = x.message ? '' : checkinAuxNote(x);   // 旧后端：用日志里的附带说明补齐「为什么没到账」
+  return { state: 'idle', name: name,
+           text: name + ': ' + (detail || '本次没有新增积分（已领取或暂无可领取的活动）') +
+                 (aux && detail.indexOf(aux) < 0 ? '；' + aux : '') +
+                 (next ? '；下次可签到 ' + next : '') };
+}
+
+// toast 配色：只有真的到账才用绿色成功色；已领取/无可领用中性警示色；整批都失败才用错误色。
+// 判据只看 state（'claimed' / 'idle' / 'failed'），不碰 DOM，可离线断言。
+function checkinToastKind(rows){
+  if(rows.some(x => x.state === 'claimed')) return 'ok';
+  if(rows.length > 0 && rows.every(x => x.state === 'failed')) return 'bad';
+  return 'warn';
+}
+
+// toast 文案：≤2 个账号逐条列明细；更多账号改摘要（谁到账/谁已领/谁失败都点名）+ 首条明细，
+// 避免账号一多就把 toast 拉到屏幕外，同时不丢关键信息。
+function checkinToastText(rows){
+  const brief = n => (n.length > 8 ? n.slice(0, 8) + '…' : n);
+  if(rows.length <= 2) return rows.map(x => x.text).join('；');
+  const pick = s => rows.filter(x => x.state === s);
+  const claimedRows = pick('claimed'), idleRows = pick('idle'), failedRows = pick('failed');
+  const groups = [];
+  if(claimedRows.length) groups.push('到账 ' + claimedRows.length + '（' + claimedRows.map(x => brief(x.name)).join('、') + '）');
+  if(idleRows.length) groups.push('已领/无可领 ' + idleRows.length + '（' + idleRows.map(x => brief(x.name)).join('、') + '）');
+  if(failedRows.length) groups.push('失败 ' + failedRows.length + '（' + failedRows.map(x => brief(x.name)).join('、') + '）');
+  return groups.join(' · ') + '；明细 ' + rows[0].text;
+}
+
 async function doCheckin(btn){
   btn.disabled = true; const ot = btn.textContent; btn.textContent = "签到中...";
   try {
@@ -1566,8 +1647,8 @@ async function doCheckin(btn){
     const res = r.results || [];
     if(!res.length) toast("未发现可签到账号", "warn");
     else {
-      const summary = res.map(x => (x.nickname||x.uid.slice(0,6)) + ": " + (x.ok ? "签到成功" : (x.error||x.msg))).join("；");
-      toast("每日签到: " + summary, res.some(x => x.ok) ? "ok" : "warn");
+      const rows = res.map(checkinOutcome);
+      toast("每日签到: " + checkinToastText(rows), checkinToastKind(rows));
     }
     await initRealm(true);      // 保留当前视图（不再跳回网关默认区）
     await Promise.all([loadAccounts(), loadModels(), loadGrowthTasks({force:true})]);

@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.14"
+VERSION = "1.2.15"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5758,6 +5758,15 @@ class Handler(BaseHTTPRequestHandler):
                     "msg": (res.get("logs") or [""])[-1],
                     "logs": res.get("logs") or [],
                     "credits": res.get("credits"),
+                    # issue #20：透传 qoder_tasks 的精确结论（前端一直在读
+                    # message / claimed / next_available_*，此前永远 undefined）。
+                    # 新增而非替换：msg/logs/credits 原样保留；老路径没有
+                    # 这些 key 时为 None（前端有兼容层），不编造默认值、
+                    # 也不参与签到主流程判定。
+                    "message": res.get("message"),
+                    "claimed": res.get("claimed"),
+                    "next_available_at": res.get("next_available_at"),
+                    "next_available_note": res.get("next_available_note"),
                 })
             qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {"results": results,

@@ -4264,6 +4264,232 @@ finally:
     _sh35.rmtree(_IDC_TMP, ignore_errors=True)
 
 print()
+print("[36] issue #20：签到结果文案分流（前端离线仿真：node 抽取 dashboard.html）")
+import shutil as _sh36
+import subprocess as _sp36
+import tempfile as _tf36
+
+_NODE36 = _sh36.which("node")
+if not _NODE36:
+    for _cand36 in (r"C:\Users\shuishui\AppData\Local\nvm\v24.19.0\node.exe",):
+        if os.path.isfile(_cand36):
+            _NODE36 = _cand36
+            break
+_DASH36 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+_JS36 = r"""
+const fs = require('fs');
+const html = fs.readFileSync(process.env.DASH36, 'utf-8');
+const mm = html.match(/<script(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/);
+const script = mm ? mm[1] : '';
+const s = script.indexOf('function fmtNextCheckin(x){');
+const e = script.indexOf('async function doCheckin(btn){');
+let pure = (s >= 0 && e > s) ? script.slice(s, e) : '';
+const MUT = process.env.MUTATE36 === '1';
+if (MUT) {
+  pure = 'function fmtNextCheckin(x){ return ""; }'
+       + ' function checkinOutcome(x){ const nm = x.nickname || String(x.uid||"").slice(0,6) || "账号";'
+       + ' return {state:"claimed", name: nm, text: nm + ": 签到成功"}; }'
+       + ' function checkinToastKind(rows){ return "ok"; }'
+       + ' function checkinToastText(rows){ return "每日签到: 签到成功"; }';
+}
+if (!pure) { console.log(JSON.stringify({missing:true})); process.exit(0); }
+const api = new Function(pure + '\nreturn {fmtNextCheckin:fmtNextCheckin,'
+  + ' checkinOutcome:checkinOutcome, checkinToastKind:checkinToastKind,'
+  + ' checkinToastText:checkinToastText};')();
+
+const NOTE = '10-05 10:00（UTC+8）';
+const CASES = {
+  claimed_new:   {uid:'aaa111', ok:true, claimed:['每日领 100'], earned_credit:100,
+                  message:'活动领取成功 +100 Credits（每日领 100）',
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_with_msg: {uid:'bbb222', ok:true, claimed:[], message:'今日活动奖励已领取',
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_no_msg:   {uid:'ccc333', ok:true, claimed:[],
+                  next_available_at:1791123600, next_available_note:NOTE},
+  idle_at_only:  {uid:'eee555', ok:true, claimed:[], next_available_at:1791123600},
+  fail_msg_only: {uid:'ddd444', ok:false, error:'', message:'token 已过期，请重新登录'},
+  legacy_credit: {uid:'fff666', ok:true, earned_credit:100, msg:''},
+  legacy_none:   {uid:'ggg777', ok:true, earned_credit:0, msg:''},
+};
+// kind 的判据是「已处理 row 的 state」，因此这里必须传 checkinOutcome 的产物
+const C_OK  = api.checkinOutcome({uid:'a1', ok:true, claimed:['活动A'], message:'到账'});
+const C_IDL = api.checkinOutcome({uid:'b2', ok:true, claimed:[], message:'已领',
+                                  next_available_note:NOTE});
+const C_FAIL= api.checkinOutcome({uid:'c3', ok:false, error:'失败原因'});
+const KIND_CASES = {
+  all_claimed: [C_OK],
+  claimed_plus_idle: [C_OK, C_IDL],
+  all_idle: [C_IDL],
+  fail_plus_idle: [C_FAIL, C_IDL],
+  all_fail: [C_FAIL],
+  empty_rows: [],
+};
+const out = {pure:true, cases:{}, kinds:{}};
+for (const k of Object.keys(CASES)) out.cases[k] = api.checkinOutcome(CASES[k]);
+for (const k of Object.keys(KIND_CASES)) {
+  out.kinds[k] = {kind: api.checkinToastKind(KIND_CASES[k]),
+                  text: api.checkinToastText(KIND_CASES[k])};
+}
+console.log(JSON.stringify(out));
+"""
+if not _NODE36:
+    skip("issue #20 前端分流仿真（本机无 node）", "node not found")
+else:
+    _dir36 = _tf36.mkdtemp(prefix="qd-js36-")
+    _jsf36 = os.path.join(_dir36, "probe.js")
+    with open(_jsf36, "w", encoding="utf-8") as _fh36:
+        _fh36.write(_JS36)
+
+    def _run36_tz(tz=None, mutate=False):
+        _env36 = dict(os.environ)
+        _env36["DASH36"] = _DASH36
+        _env36["MUTATE36"] = "1" if mutate else "0"
+        if tz:
+            _env36["TZ"] = tz
+        _r36 = _sp36.run([_NODE36, _jsf36], capture_output=True, text=True,
+                         encoding="utf-8", env=_env36, timeout=60)
+        try:
+            return json.loads((_r36.stdout or "").strip().splitlines()[-1])
+        except Exception:
+            return {"missing": True,
+                    "err": ((_r36.stderr or _r36.stdout or "")[:200])}
+
+    _b36 = _run36_tz()
+    check("#52 前端：能抽到分流纯函数组（fmtNextCheckin/checkinOutcome/"
+          "checkinToastKind/checkinToastText）",
+          isinstance(_b36, dict) and _b36.get("pure") is True,
+          json.dumps(_b36, ensure_ascii=False)[:200])
+    if isinstance(_b36, dict) and _b36.get("pure"):
+        _cs36 = _b36.get("cases") or {}
+        _ks36 = _b36.get("kinds") or {}
+
+        def _txt36(_k):
+            return str((_cs36.get(_k) or {}).get("text") or "")
+
+        def _st36(_k):
+            return (_cs36.get(_k) or {}).get("state")
+
+        check("#52 前端·claimed 非空 → state=claimed 且文案含服务端 message",
+              _st36("claimed_new") == "claimed"
+              and "活动领取成功 +100 Credits" in _txt36("claimed_new"),
+              (_st36("claimed_new"), _txt36("claimed_new")[:90]))
+        check("#52 前端·claimed 空（有 message）→ **不含「签到成功」** 且带下次可签到",
+              _st36("idle_with_msg") != "claimed"
+              and "签到成功" not in _txt36("idle_with_msg")
+              and "10-05 10:00" in _txt36("idle_with_msg"),
+              (_st36("idle_with_msg"), _txt36("idle_with_msg")[:110]))
+        check("#52 前端·claimed 空（无 message）→ 兜底文案 + 下次可签到",
+              _st36("idle_no_msg") != "claimed"
+              and "签到成功" not in _txt36("idle_no_msg")
+              and "本次没有新增积分" in _txt36("idle_no_msg")
+              and "10-05 10:00" in _txt36("idle_no_msg"),
+              (_st36("idle_no_msg"), _txt36("idle_no_msg")[:110]))
+        check("#52 前端·ok=false 只有 message → state=failed、文案含 message、非 undefined",
+              _st36("fail_msg_only") == "failed"
+              and "token 已过期" in _txt36("fail_msg_only")
+              and "undefined" not in _txt36("fail_msg_only"),
+              (_st36("fail_msg_only"), _txt36("fail_msg_only")[:110]))
+        check("#52 前端·旧字段兜底（earned_credit>0、无 claimed）→ 视为到账且含 +100",
+              _st36("legacy_credit") == "claimed" and "100" in _txt36("legacy_credit"),
+              (_st36("legacy_credit"), _txt36("legacy_credit")[:90]))
+        check("#52 前端·旧字段兜底（earned_credit=0）→ 不得出现「签到成功」",
+              _st36("legacy_none") != "claimed"
+              and "签到成功" not in _txt36("legacy_none"),
+              (_st36("legacy_none"), _txt36("legacy_none")[:90]))
+        _at36 = _txt36("idle_at_only")
+        check("#52 前端·note 缺失时用 next_available_at 兜底格式化（含 UTC+8 标注）",
+              "（UTC+8）" in _at36 and "-" in _at36 and _at36 != _txt36("idle_no_msg"),
+              _at36[:110])
+        _b36u = _run36_tz("UTC")
+        _b36n = _run36_tz("America/New_York")
+        check("#52 前端·时区无关：TZ=UTC / America/New_York / 默认 三份输出逐字节一致",
+              json.dumps(_b36u, ensure_ascii=False, sort_keys=True)
+              == json.dumps(_b36n, ensure_ascii=False, sort_keys=True)
+              == json.dumps(_b36, ensure_ascii=False, sort_keys=True),
+              ((_b36u.get("cases") or {}).get("idle_at_only", {}).get("text"),
+               (_b36n.get("cases") or {}).get("idle_at_only", {}).get("text")))
+        for _k36, _want36 in (("all_claimed", "ok"), ("claimed_plus_idle", "ok"),
+                              ("all_idle", "warn"), ("fail_plus_idle", "warn"),
+                              ("all_fail", "bad"), ("empty_rows", "warn")):
+            check("#52 前端·toast kind（%s）→ %s" % (_k36, _want36),
+                  (_ks36.get(_k36) or {}).get("kind") == _want36,
+                  (_k36, (_ks36.get(_k36) or {}).get("kind")))
+        _bm36 = _run36_tz(None, mutate=True)
+        _mt36 = str(((_bm36.get("cases") or {}).get("idle_with_msg") or {}).get("text") or "")
+        check("#52 能红证据：把分流改回「ok 就写死签到成功」→ claimed 空的两条断言必红",
+              "签到成功" in _mt36, _mt36[:80])
+    else:
+        skip("issue #20 前端分流断言（抽不到纯函数组）",
+             json.dumps(_b36, ensure_ascii=False)[:140])
+    _sh36.rmtree(_dir36, ignore_errors=True)
+
+print()
+print("[37] issue #20 后端：下次可签到窗口（next_checkin_window）边界 + 时区无关")
+import datetime as _dt37
+_UTC8_37 = _dt37.timezone(_dt37.timedelta(hours=8))
+
+
+def _ep37(_y, _m, _d, _hh=10, _mm=0, _ss=0):
+    return int(_dt37.datetime(_y, _m, _d, _hh, _mm, _ss, tzinfo=_UTC8_37).timestamp())
+
+
+check("#52 后端·函数与常量存在（next_checkin_window / CHECKIN_WINDOW_HOUR_UTC8=10）",
+      callable(getattr(A, "next_checkin_window", None))
+      and getattr(A, "CHECKIN_WINDOW_HOUR_UTC8", None) == 10,
+      (callable(getattr(A, "next_checkin_window", None)),
+       getattr(A, "CHECKIN_WINDOW_HOUR_UTC8", None)))
+
+for _label37, _now37, _exp_ep37, _exp_note37 in (
+        ("09:59:59（10:00 前 1 秒）", _ep37(2026, 10, 5, 9, 59, 59),
+         _ep37(2026, 10, 5, 10, 0, 0), "10-05 10:00（UTC+8）"),
+        ("10:00:00 整点（含）", _ep37(2026, 10, 5, 10, 0, 0),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("10:00:01（10:00 后 1 秒）", _ep37(2026, 10, 5, 10, 0, 1),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("08:59:00", _ep37(2026, 10, 5, 8, 59, 0),
+         _ep37(2026, 10, 5, 10, 0, 0), "10-05 10:00（UTC+8）"),
+        ("23:59:59（当日末尾）", _ep37(2026, 10, 5, 23, 59, 59),
+         _ep37(2026, 10, 6, 10, 0, 0), "10-06 10:00（UTC+8）"),
+        ("跨月 01-31 23:59", _ep37(2026, 1, 31, 23, 59, 0),
+         _ep37(2026, 2, 1, 10, 0, 0), "02-01 10:00（UTC+8）"),
+        ("跨年 12-31 23:59", _ep37(2026, 12, 31, 23, 59, 0),
+         _ep37(2027, 1, 1, 10, 0, 0), "01-01 10:00（UTC+8）"),
+        ("月末 04-30 10:00 后", _ep37(2026, 4, 30, 10, 0, 1),
+         _ep37(2026, 5, 1, 10, 0, 0), "05-01 10:00（UTC+8）")):
+    _at37, _note37 = A.next_checkin_window(_now37)
+    check("#52 后端·边界（%s）→ at 与 note 都正确" % _label37,
+          _at37 == _exp_ep37 and _note37 == _exp_note37,
+          (_at37, _exp_ep37, _note37, _exp_note37))
+
+_at37b, _note37b = A.next_checkin_window(_ep37(2026, 10, 5, 9, 0, 0))
+_recalc37 = _dt37.datetime.fromtimestamp(_at37b, _UTC8_37).strftime("%m-%d %H:%M") + "（UTC+8）"
+check("#52 后端·at 与 note 同源（note 可由 at 反算得到，不存在两处各算一遍）",
+      _recalc37 == _note37b, (_recalc37, _note37b))
+
+_at37c, _note37c = A.next_checkin_window(1791165600 - 1)
+check("#52 后端·契约样例：next_checkin_window(1791165600-1)[1] == 10-05 10:00（UTC+8）",
+      _note37c == "10-05 10:00（UTC+8）", (_at37c, _note37c))
+
+_here37 = os.path.dirname(os.path.abspath(__file__))
+_cmd37 = ("import sys; sys.path.insert(0, %r); import qoder_accounts as A; "
+          "print(A.next_checkin_window(1791165599))" % _here37)
+
+
+def _run_tz37(_tz):
+    _env37 = dict(os.environ)
+    _env37["TZ"] = _tz
+    _env37["PYTHONIOENCODING"] = "utf-8"
+    _r37 = _sp36.run([sys.executable, "-c", _cmd37], capture_output=True,
+                     text=True, encoding="utf-8", env=_env37, timeout=60)
+    return (_r37.stdout or "").strip()
+
+
+_tz37 = {_tz: _run_tz37(_tz) for _tz in ("UTC", "America/New_York", "Asia/Shanghai")}
+check("#52 后端·时区无关：TZ=UTC / America/New_York / Asia/Shanghai 三进程输出逐字节一致",
+      len(set(_tz37.values())) == 1 and "10-05 10:00（UTC+8）" in list(_tz37.values())[0],
+      _tz37)
+
+print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
       % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
 print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"

@@ -13,6 +13,7 @@
   - 账号导入导出（Dry-Run 预检）与 JSON 持久化（原子写）
 """
 import base64
+import datetime
 import ipaddress
 import json
 import os
@@ -654,6 +655,35 @@ def normalize_epoch(value):
     if number > 1e11:      # 毫秒
         number /= 1000.0
     return int(number)
+
+
+# ---------------------------------------------------------------------------
+# 每日签到的「下次可签到时间」
+# ---------------------------------------------------------------------------
+# 官方规则：每日 10:00（UTC+8）刷新，错过不补。因此这条时间**必须**按固定
+# UTC+8 计算与呈现，**不能**用系统本地时区——容器里常是 UTC，若按本地渲染，
+# 用户看到的「下次」会和官方说明差 8 小时，对不上。
+CHECKIN_WINDOW_HOUR_UTC8 = 10
+_UTC8 = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def next_checkin_window(now=None):
+    """下一个「每日 10:00（UTC+8）」窗口 → (epoch 秒:int, 人类可读:str)。
+
+    边界（与 issue #20 的口径一致）：
+      · 今天 10:00 **之前**（now < 当日 10:00）→ 今天 10:00；
+      · 到达/晚于 10:00（含刚领取成功的情形）→ 明天 10:00。
+      取「到达即算下一轮」是为了不返回一个已经到点的时刻。
+    note 形如 "10-05 10:00（UTC+8）"，始终以 UTC+8 呈现；两个返回值同源，
+    调用方只需调一次即可拿到成对的字段，避免两处各算一遍导致不一致。
+    """
+    ts = time.time() if now is None else float(now)
+    now8 = datetime.datetime.fromtimestamp(ts, _UTC8)
+    boundary = now8.replace(hour=CHECKIN_WINDOW_HOUR_UTC8, minute=0,
+                            second=0, microsecond=0)
+    if now8 >= boundary:
+        boundary += datetime.timedelta(days=1)
+    return int(boundary.timestamp()), boundary.strftime("%m-%d %H:%M") + "（UTC+8）"
 
 
 # ---------------------------------------------------------------------------
@@ -1480,9 +1510,13 @@ class Account(object):
         gap: 相邻两次 claim 请求之间的间隔（秒）；None=使用模块级安全默认
              CLAIM_GAP_DEFAULT（>=1.0s），显式传入时按传入值（下限 0）。
 
-        返回 {ok, claimed:[...], already:[...], earned, message, campaigns}
+        返回 {ok, claimed:[...], already:[...], earned, message, campaigns,
+              next_available_at, next_available_note}
           - 已是 CLAIMED 的活动计入 already（"今日已领取"）
           - 无可领取项且没有任何活动 -> ok=True + message 说明
+          - next_available_at / next_available_note：下一个「每日 10:00（UTC+8）」
+            的 epoch 秒与可读文本（见 next_checkin_window）；**无论本次是否真的
+            领到都给出**，前端只在"没到账"时渲染。
         """
         claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
         # 领取前只需"身份有效"（内存 → 落盘 → 组件），**不要** force 刷新：
@@ -1491,9 +1525,12 @@ class Account(object):
         native_machine_identity(self.realm, self.uid)
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
+            next_at, next_note = next_checkin_window()
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",
                     "earned": 0, "claimed": [], "already": [], "blocked": [],
-                    "pending": [], "locked": [], "codes": [], "views": []}
+                    "pending": [], "locked": [], "codes": [], "views": [],
+                    "next_available_at": next_at,
+                    "next_available_note": next_note}
         claimed, already, earned, errors, blocked = [], [], 0, [], []
         pending, locked, codes, views = [], [], [], []   # 券/成就/详情类
         for c in st["campaigns"]:
@@ -1597,11 +1634,16 @@ class Account(object):
             msg += extra
         # 领取动作会改变活动状态：让下一次列表查询重新拉取（不吃 20s 缓存）
         self._campaigns_cache = None
+        # 「下次可签到时间」无条件给出（真领取 / 已领 / 被挡 / 名额发完 / 任务未完成 /
+        # 无可领项 全部走这一个出口）：是否渲染由前端按需决定，后端不替前端判断。
+        next_at, next_note = next_checkin_window()
         return {"ok": not errors, "claimed": claimed, "already": already,
                 "blocked": blocked, "earned": earned, "message": msg,
                 "pending": pending, "locked": locked, "codes": codes,
                 "views": views,
-                "campaigns": st["campaigns"], "errors": errors}
+                "campaigns": st["campaigns"], "errors": errors,
+                "next_available_at": next_at,
+                "next_available_note": next_note}
 
 
     def _stamp_checkin(self):
