@@ -324,18 +324,237 @@ def local_vm_status(realm=None, force=False):
     return st
 
 
+# ---------------------------------------------------------------------------
+# 机器身份落盘缓存（issue #18：Docker 重建/升级容器后设备身份不变）
+# ---------------------------------------------------------------------------
+# 组件每次调用都会给出**新**身份——所以"调用后顺便更新缓存"等于没缓存。
+# 本实现的纪律（设计 .team/00-IDENTITY-CACHE-DESIGN.md §9）：
+#   · **缓存优先**：落盘命中就不调组件（「重建不换」的唯一来源）；
+#   · 落盘只在两处写入：① 落盘没有该 realm 的可用记录（不存在 / 已按 TTL
+#     失效 / 损坏）时取到的新身份；② 自愈路径（campaigns() 被判未认可后的
+#     force 刷新）覆盖。其它路径一律不写，否则身份又会被自己刷掉。
+#   · 失败回退：组件不可用时用落盘缓存（哪怕过期）——比 derived 假身份好。
+_IDENTITY_CACHE_LOCK = threading.Lock()
+_identity_cache_reuse_logged = set()     # 「复用缓存」INFO：每个 realm 一次
+_identity_cache_corrupt_warned = False   # 「损坏/字段不全」WARN：进程内一次
+_identity_cache_diff_warned = False      # 「与组件输出不一致」INFO：进程内一次
+_identity_reset_done = False             # QD_MACHINE_IDENTITY_RESET 只消费一次
+
+
+def machine_identity_cache_path():
+    """机器身份落盘缓存路径：$ACCOUNTS_DIR/machine_identity.json（未设时用
+    <repo>/accounts/machine_identity.json，与网关的账号目录一致）。"""
+    base = (os.environ.get("ACCOUNTS_DIR") or "").strip()
+    if not base:
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
+    return os.path.join(base, "machine_identity.json")
+
+
+def _identity_cache_enabled():
+    """QD_MACHINE_IDENTITY_CACHE：auto/on（默认启用）/ off（关闭＝仅内存＝旧行为）。"""
+    value = (os.environ.get("QD_MACHINE_IDENTITY_CACHE") or "auto").strip().lower()
+    return value not in ("off", "0", "false", "no", "disable", "disabled")
+
+
+def _identity_cache_ttl():
+    """QD_MACHINE_IDENTITY_CACHE_TTL：秒；0（默认）＝不过期。"""
+    try:
+        ttl = float(os.environ.get("QD_MACHINE_IDENTITY_CACHE_TTL") or 0)
+    except (TypeError, ValueError):
+        ttl = 0.0
+    return max(0.0, ttl)
+
+
+def _identity_cache_log(level, message):
+    """缓存事件输出到 stderr；去重由各调用点的标记控制。"""
+    try:
+        import sys
+        print("[machine-identity] %s: %s" % (level, message), file=sys.stderr)
+    except Exception:
+        pass
+
+
+def _identity_entry_to_ident(entry):
+    """缓存条目 -> ident dict；字段不全/类型不对时返回 None（视为无缓存）。"""
+    if not isinstance(entry, dict):
+        return None
+    token = str(entry.get("machineToken") or "").strip()
+    mtype = str(entry.get("machineType") or "").strip()
+    code = str(entry.get("machineCode") or "").strip()
+    if not (token and mtype and code):
+        return None
+    vm_info = entry.get("vm_info") if isinstance(entry.get("vm_info"), dict) else {}
+    return {"machineToken": token, "machineType": mtype, "machineCode": code,
+            "vm": bool(entry.get("vm")),
+            "vm_info": vm_info,
+            "source": str(entry.get("source") or MACHINE_IDENTITY_NATIVE)}
+
+
+def _identity_entry_expired(entry, ttl, now):
+    """按 TTL 判断条目是否过期（TTL=0 永不过期；cached_at 缺失视为过期）。"""
+    if ttl <= 0:
+        return False
+    try:
+        cached_at = float(entry.get("cached_at") or 0)
+    except (TypeError, ValueError):
+        return True
+    return (now - cached_at) >= ttl
+
+
+def _identity_cache_warn_corrupt(reason):
+    """损坏/字段不全：WARN 一次（进程内），随后按"无缓存"重建。"""
+    global _identity_cache_corrupt_warned
+    if _identity_cache_corrupt_warned:
+        return
+    _identity_cache_corrupt_warned = True
+    _identity_cache_log(
+        "WARN", "machine identity cache unreadable (%s); regenerating" % reason)
+
+
+def _read_identity_cache_doc():
+    """读缓存文档；文件缺失返回空壳；损坏/结构异常返回空壳（并首次 WARN）。
+
+    绝不抛异常——缓存损坏只降级为"无缓存"，不影响业务流程。
+    """
+    path = machine_identity_cache_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except FileNotFoundError:
+        return {"version": 1, "realm": {}}
+    except Exception as exc:
+        _identity_cache_warn_corrupt("%s: %s" % (type(exc).__name__, exc))
+        return {"version": 1, "realm": {}}
+    if not (isinstance(doc, dict) and isinstance(doc.get("realm"), dict)):
+        _identity_cache_warn_corrupt("unexpected structure")
+        return {"version": 1, "realm": {}}
+    return doc
+
+
+def _load_identity_cache(realm, now, allow_expired=False):
+    """读落盘缓存；返回 ident dict 或 None（无 / 损坏 / 字段不全 / 过期）。"""
+    entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
+    if entry is None:
+        return None
+    ident = _identity_entry_to_ident(entry)
+    if ident is None:
+        _identity_cache_warn_corrupt("missing fields")
+        return None
+    if not allow_expired and _identity_entry_expired(entry, _identity_cache_ttl(), now):
+        return None
+    return ident
+
+
+def _write_identity_cache_doc(doc):
+    """原子写缓存文档（临时文件 + os.replace、权限 0600）；失败静默返回 False。"""
+    path = machine_identity_cache_path()
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _save_identity_cache(realm, ident, force=False):
+    """把身份写入落盘缓存（读-改-写 + 锁 + 原子替换）。
+
+    返回 None = 采纳新值（已写盘）；返回 dict = 以磁盘既有值为准（并发防御：
+    另一个实例刚写入未过期的缓存，见设计 §4②"keeping cached"）。
+    """
+    global _identity_cache_diff_warned
+    with _IDENTITY_CACHE_LOCK:
+        doc = _read_identity_cache_doc()
+        realms = doc.setdefault("realm", {})
+        old_entry = realms.get(realm)
+        old_ident = _identity_entry_to_ident(old_entry) if old_entry else None
+        if (not force and old_ident is not None
+                and not _identity_entry_expired(old_entry, _identity_cache_ttl(),
+                                                time.time())
+                and old_ident != ident):
+            if not _identity_cache_diff_warned:
+                _identity_cache_diff_warned = True
+                _identity_cache_log(
+                    "INFO",
+                    "identity cache differs from fresh component output; keeping cached")
+            return old_ident
+        entry = dict(ident)
+        entry["cached_at"] = time.time()
+        realms[realm] = entry
+        doc["version"] = 1
+        _write_identity_cache_doc(doc)
+        if force and old_ident is not None:
+            _identity_cache_log(
+                "WARN",
+                "machine identity refreshed after upstream rejection (cache updated) — %s"
+                % realm)
+        return None
+
+
+def _consume_identity_reset():
+    """QD_MACHINE_IDENTITY_RESET=1：清空落盘缓存（进程内只消费一次）。
+
+    直接删 accounts/machine_identity.json 同样有效（最直观，不必记变量名）。
+    """
+    global _identity_reset_done
+    if _identity_reset_done:
+        return
+    if (os.environ.get("QD_MACHINE_IDENTITY_RESET") or "").strip().lower() \
+            not in ("1", "true", "yes", "on"):
+        return
+    _identity_reset_done = True
+    with _IDENTITY_CACHE_LOCK:
+        try:
+            os.remove(machine_identity_cache_path())
+            _identity_cache_log(
+                "INFO", "machine identity cache cleared (QD_MACHINE_IDENTITY_RESET=1)")
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            _identity_cache_log(
+                "WARN", "could not clear machine identity cache: %s" % exc)
+
+
 def native_machine_identity(realm, account_id, force=False):
     """调用官方原生桥取真实机器身份；任何失败返回 {}（调用方回退派生值）。
 
     身份是**机器级**的（实测不同 account id 返回同一份），按区域短缓存
-    NATIVE_IDENTITY_TTL 秒——它会随时间轮换，长缓存会拿到过期身份导致活动
-    列表被过滤；force=True 时跳过缓存重新取值。
+    NATIVE_IDENTITY_TTL 秒；force=True 跳过缓存重新取值（服务端明确拒绝时的
+    自愈路径才用它——见设计 §9.1）。
+
+    落盘缓存（issue #18）：组件每次调用都会给出**新**身份，所以本实现是
+    **缓存优先**——落盘命中就不调组件，Docker 重建/升级容器后身份不变；
+    组件不可用时回退落盘缓存（哪怕过期），不再被迫退化到 derived 假身份。
     """
     now = time.time()
+    cache_on = _identity_cache_enabled()
+    _consume_identity_reset()
     if not force:
+        # ① 内存缓存（1800s，现状不变）
         hit = _native_ident_cache.get(realm)
         if hit and now - hit[0] < NATIVE_IDENTITY_TTL:
             return hit[1]
+        # ② 落盘缓存：命中就**不调组件**（本设计的核心）
+        if cache_on:
+            stored = _load_identity_cache(realm, now)
+            if stored is not None:
+                _native_ident_cache[realm] = (now, stored)
+                if realm not in _identity_cache_reuse_logged:
+                    _identity_cache_reuse_logged.add(realm)
+                    _identity_cache_log(
+                        "INFO",
+                        "machine identity cache: reusing cached identity for %s "
+                        "(rebuilds keep the same device)" % realm)
+                return stored
+    # ③ 调组件
     ident = {}
     data = run_runtime_info(realm, account_id)
     if data:
@@ -349,8 +568,22 @@ def native_machine_identity(realm, account_id, force=False):
                      "vm": bool(vm_info.get("isVm")),
                      "vm_info": vm_info,
                      "source": MACHINE_IDENTITY_NATIVE}
-    _native_ident_cache[realm] = (now, ident)
-    return ident
+    if ident:
+        if cache_on:
+            kept = _save_identity_cache(realm, ident, force=force)
+            if kept is not None:
+                ident = kept
+        _native_ident_cache[realm] = (now, ident)
+        return ident
+    # ④ 组件失败：回退落盘缓存（哪怕已过期）——alpine 缺兼容层/组件被删时
+    #    仍能用真身份，比 derived 好（设计 §3.2 第 3 行）。
+    if cache_on:
+        stored = _load_identity_cache(realm, now, allow_expired=True)
+        if stored is not None:
+            _native_ident_cache[realm] = (now, stored)
+            return stored
+    _native_ident_cache[realm] = (now, {})
+    return {}
 
 # 签到能力探测缓存：404（接口不存在）后 N 秒内不再重复探测，避免每次巡检都
 # 打一个必然失败的请求；到期自动重探，官方上线即可自动恢复。
@@ -1075,6 +1308,8 @@ class Account(object):
         if isinstance(q, dict) and not q.get("showCampaign") \
                 and getattr(self, "machine_identity_source", "") in \
                 (MACHINE_IDENTITY_NATIVE, "native"):
+            # 服务端已不认当前身份，必须换一个**新的**：force 跳过全部缓存并
+            # **覆盖落盘**（设计 §9.1/§9.2 写入点②），否则重建后仍会用被拒的旧身份。
             native_machine_identity(self.realm, self.uid, force=True)
             q2, code2, err2 = self._campaigns_get()
             if isinstance(q2, dict) and q2.get("showCampaign"):
@@ -1250,7 +1485,10 @@ class Account(object):
           - 无可领取项且没有任何活动 -> ok=True + message 说明
         """
         claim_gap = CLAIM_GAP_DEFAULT if gap is None else max(0.0, float(gap))
-        native_machine_identity(self.realm, self.uid, force=True)
+        # 领取前只需"身份有效"（内存 → 落盘 → 组件），**不要** force 刷新：
+        # force 会让每次签到都换一套身份并把落盘缓存刷掉，「重建不换」就失效了
+        # （设计 §9.1）。身份真被服务端作废时由 campaigns() 的自愈兜底刷新。
+        native_machine_identity(self.realm, self.uid)
         st = self.campaigns(force=True)      # 领取路径必须绕过缓存，看最新状态
         if not st.get("ok"):
             return {"ok": False, "error": st.get("error") or "campaigns 查询失败",

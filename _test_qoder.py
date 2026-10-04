@@ -1870,13 +1870,18 @@ check("retry keeps the second (populated) payload",
       len(_st25.get("campaigns") or []) == 1
       and _st25["campaigns"][0]["campaign_key"] == "act-x")
 
-# --- 20.6 campaign_checkin 先强制刷新身份（轮换后不漏领） ---
+# --- 20.6 campaign_checkin 走【缓存优先】的身份链路 ---
+# 设计 §9.1（身份落盘缓存）明确废除"每次领取都 force 刷新"：那会每次把落盘缓存
+# 刷成新身份，直接违背"重建不换"的目标。新语义＝照常走身份链路但【不传 force】，
+# 由 native_machine_identity 的缓存优先逻辑决定是否真的调组件。
 _orig_get2 = A.Account._campaigns_get
 _orig_native2 = A.native_machine_identity
+_calls2 = []
 _forced2 = []
 
 
 def _stub_native2(realm, account_id, force=False):
+    _calls2.append((realm, account_id))
     if force:
         _forced2.append(account_id)
     return {"machineToken": "t", "machineType": "ty", "machineCode": "c",
@@ -1893,8 +1898,9 @@ try:
 finally:
     A.Account._campaigns_get = _orig_get2
     A.native_machine_identity = _orig_native2
-check("campaign_checkin force-refreshes the machine identity first",
-      _forced2 == ["cp26"], _forced2)
+check("campaign_checkin 不 force：走缓存优先链路（设计 §9.1 废除每次领取换身份）",
+      _forced2 == [] and len(_calls2) >= 1 and _calls2[0] == ("cn", "cp26"),
+      (_forced2, _calls2))
 
 # --- 20.4 思考档位归一化（官方词表因模型而异，未命中会被上游静默忽略） ---
 _meta_df = next(m for m in C.models_for_realm("cn") if m["key"] == "dfmodel")
@@ -4032,9 +4038,230 @@ check("#37·结构化交互：on 模式下回读守卫仍独立生效（同一�
 _dd_pre = "我先看看：" + _M33[:9]
 _dd_rest = _M33[9:] + "\n" + _CALLS34
 _t, _tc, _fn = _run34([_f33(_dd_pre), _f33(_dd_rest), _f33("", "stop")])
-check("跨帧补全依赖窗口：散文 + 被切开的 marker → marker 不泄漏且散文保留",
-      _M33 not in _t and _M33[:9] not in _t and "我先看看" in _t,
-      (_tc, _t[:60]))
+print()
+print("[35] 机器身份落盘缓存（task-48 · 设计 v1.2.13 第七节：12 条离线）")
+import shutil as _sh35
+import tempfile as _tf35
+import threading as _th35
+
+_IDC_KEYS = ("ACCOUNTS_DIR", "QD_MACHINE_IDENTITY_CACHE",
+             "QD_MACHINE_IDENTITY_CACHE_TTL", "QD_MACHINE_IDENTITY_RESET")
+_IDC_ORIG_ENV = {_k: os.environ.get(_k) for _k in _IDC_KEYS}
+_IDC_ORIG_RUN = A.run_runtime_info
+_IDC_TMP = _tf35.mkdtemp(prefix="qd-idcache-")
+_IDC_FILE = os.path.join(_IDC_TMP, "machine_identity.json")
+
+
+def _idc_env(**over):
+    """切换 ACCOUNTS_DIR 与三个开关，并清内存缓存与落盘文件。"""
+    os.environ["ACCOUNTS_DIR"] = over.get("accounts_dir") or _IDC_TMP
+    for _k in _IDC_KEYS[1:]:
+        if over.get(_k) is not None:
+            os.environ[_k] = str(over[_k])
+        else:
+            os.environ.pop(_k, None)
+    A._native_ident_cache.clear()
+    try:
+        os.remove(_IDC_FILE)
+    except OSError:
+        pass
+
+
+def _idc_stub(calls, fail=False):
+    def _f(realm, account_id=""):
+        calls.append((realm, account_id))
+        if fail:
+            return {}
+        n = len(calls)
+        return {"machineToken": "tok-%d" % n, "machineType": "ty%d" % n,
+                "machineCode": "co%d" % n, "vmInfo": {"isVm": False}}
+    return _f
+
+
+def _idc_read():
+    try:
+        with open(_IDC_FILE, encoding="utf-8") as _fh:
+            return json.load(_fh)
+    except Exception:
+        return None
+
+
+def _idc_tok(blob):
+    try:
+        return (blob.get("realm") or {}).get("cn", {}).get("machineToken")
+    except Exception:
+        return None
+
+
+try:
+    _idc_env()
+    _c1 = []
+    A.run_runtime_info = _idc_stub(_c1)
+    _i1 = A.native_machine_identity("cn", "u1")
+    _f1 = _idc_read()
+    check("#48-1 首次调用：无缓存 → 调组件一次并落盘（version/realm/三字段完整）",
+          len(_c1) == 1 and _i1.get("machineToken") == "tok-1"
+          and isinstance(_f1, dict) and _f1.get("version") == 1
+          and _idc_tok(_f1) == "tok-1"
+          and ((_f1.get("realm") or {}).get("cn", {}).get("machineType") == "ty1")
+          and ((_f1.get("realm") or {}).get("cn", {}).get("machineCode") == "co1"),
+          (_c1, _f1))
+
+    A._native_ident_cache.clear()
+    _c2 = []
+    A.run_runtime_info = _idc_stub(_c2)
+    _i2 = A.native_machine_identity("cn", "u2")
+    check("#48-2 【命门】落盘缓存命中：第二次调用**不触发组件**（桩计数=0）且身份逐字节相同",
+          len(_c2) == 0 and _i2.get("machineToken") == "tok-1"
+          and _i2.get("machineType") == "ty1", (_c2, _i2))
+
+    _c3 = []
+    A.run_runtime_info = _idc_stub(_c3)
+    _i3 = A.native_machine_identity("cn", "u3", force=True)
+    check("#48-3 force=True：必调组件并覆盖落盘缓存",
+          len(_c3) == 1 and _i3.get("machineToken") == "tok-1"
+          and _idc_tok(_idc_read()) == "tok-1", (_c3, _idc_read()))
+
+    # 设计 §3.2 行 3 的场景：缓存【已过期】→ 调组件 → 组件失败 → 回退到过期缓存。
+    # （缓存未过期时按行 2 根本不会调组件，那种构造断言不到"回退"路径。）
+    _idc_env(QD_MACHINE_IDENTITY_CACHE_TTL="1")
+    _c4a = []
+    A.run_runtime_info = _idc_stub(_c4a)
+    _i4a = A.native_machine_identity("cn", "u4")
+    _f4 = _idc_read()
+    try:
+        _f4["realm"]["cn"]["cached_at"] = time.time() - 10      # 人为过期
+        with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+            json.dump(_f4, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    A._native_ident_cache.clear()
+    _c4b = []
+    A.run_runtime_info = _idc_stub(_c4b, fail=True)
+    _i4b = A.native_machine_identity("cn", "u4b")
+    check("#48-4 组件失败但落盘有（过期）缓存 → 仍返回缓存身份，且不写坏缓存文件",
+          len(_c4a) == 1 and len(_c4b) == 1
+          and _i4b.get("machineToken") == _i4a.get("machineToken")
+          and _idc_tok(_idc_read()) == _i4a.get("machineToken"),
+          (_c4b, _i4b, _idc_read()))
+
+    _idc_env()
+    _c5 = []
+    A.run_runtime_info = _idc_stub(_c5, fail=True)
+    check("#48-5 组件失败且无缓存 → 返回 {}（现状不变）",
+          A.native_machine_identity("cn", "u5") == {} and len(_c5) == 1)
+
+    _idc_env(QD_MACHINE_IDENTITY_CACHE="off")
+    _c6 = []
+    A.run_runtime_info = _idc_stub(_c6)
+    A.native_machine_identity("cn", "u6")
+    check("#48-6 QD_MACHINE_IDENTITY_CACHE=off → 不落盘（行为同旧）",
+          _idc_read() is None and len(_c6) == 1, _idc_read())
+
+    _idc_env(QD_MACHINE_IDENTITY_CACHE_TTL="1")
+    _c7 = []
+    A.run_runtime_info = _idc_stub(_c7)
+    A.native_machine_identity("cn", "u7")
+    _f7 = _idc_read()
+    try:
+        _f7["realm"]["cn"]["cached_at"] = time.time() - 10
+        with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+            json.dump(_f7, _fh, ensure_ascii=False)
+    except Exception:
+        pass
+    A._native_ident_cache.clear()
+    A.native_machine_identity("cn", "u7b")
+    check("#48-7 TTL 正数：过期后重新调组件（缓存被刷新）", len(_c7) == 2, len(_c7))
+
+    _idc_env()
+    _c8a = []
+    A.run_runtime_info = _idc_stub(_c8a)
+    A.native_machine_identity("cn", "u8")
+    os.environ["QD_MACHINE_IDENTITY_RESET"] = "1"
+    A._native_ident_cache.clear()
+    _c8b = []
+    A.run_runtime_info = _idc_stub(_c8b)
+    _i8 = A.native_machine_identity("cn", "u8b")
+    check("#48-8 QD_MACHINE_IDENTITY_RESET=1 → 清空缓存并重新取身份",
+          len(_c8b) >= 1 and bool(_i8.get("machineToken")), (len(_c8a), len(_c8b)))
+
+    _idc_env()
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        _fh.write('{"version": 1, "realm": {"cn": {"machineToken": "trunc')
+    _c9 = []
+    A.run_runtime_info = _idc_stub(_c9)
+    _err9 = None
+    try:
+        _i9 = A.native_machine_identity("cn", "u9")
+    except Exception as _e9:
+        _err9 = _e9
+        _i9 = {}
+    check("#48-9 缓存文件损坏（截断 JSON）→ 不抛异常，回退调组件",
+          _err9 is None and len(_c9) == 1 and bool((_i9 or {}).get("machineToken")),
+          (_err9, len(_c9)))
+
+    _idc_env()
+    _c10 = []
+    _lk10 = _th35.Lock()
+
+    def _slow10(realm, account_id=""):
+        with _lk10:
+            _c10.append(1)
+            _n = len(_c10)
+        time.sleep(0.05)
+        return {"machineToken": "tok-%d" % _n, "machineType": "ty", "machineCode": "co"}
+
+    A.run_runtime_info = _slow10
+    _th35.Thread(target=lambda: A.native_machine_identity("cn", "t1")).start()
+    _th35.Thread(target=lambda: A.native_machine_identity("cn", "t2")).start()
+    time.sleep(0.6)
+    check("#48-10 并发首次：文件仍可解析（不损坏），且至少写入一次",
+          isinstance(_idc_read(), dict) and _idc_tok(_idc_read()) is not None,
+          _idc_read())
+
+    _idc_env()
+    _c11 = []
+    A.run_runtime_info = _idc_stub(_c11)
+    A.native_machine_identity("cn", "u11")
+    _tok_before11 = _idc_tok(_idc_read())
+    _acc11 = A.Account({"uid": "heal48", "realm": "cn", "accessToken": "dt-x"})
+    _acc11.machine_identity_source = "runtime-info"
+    _orig_get11 = A.Account._campaigns_get
+    _seq11 = []
+
+    def _cget11(self):
+        _seq11.append(1)
+        return (({"showCampaign": False} if len(_seq11) == 1
+                 else {"showCampaign": True}), 200, "")
+
+    A.Account._campaigns_get = _cget11
+    try:
+        _acc11.campaigns(force=True)
+    finally:
+        A.Account._campaigns_get = _orig_get11
+    _tok_after11 = _idc_tok(_idc_read())
+    check("#48-11 自愈路径：列表被拒 → force 刷新 → **落盘被更新**（不只更新内存）",
+          len(_c11) >= 2 and _tok_before11 != _tok_after11,
+          (_tok_before11, _tok_after11, len(_c11)))
+
+    _idc_env()
+    with open(_IDC_FILE, "w", encoding="utf-8") as _fh:
+        json.dump({"version": 1, "realm": {"cn": {"machineToken": ""}}}, _fh)
+    _c12 = []
+    A.run_runtime_info = _idc_stub(_c12)
+    _i12 = A.native_machine_identity("cn", "u12")
+    check("#48-12 缓存字段缺失（machineToken 空）→ 视为无缓存，回退调组件",
+          len(_c12) == 1 and (_i12 or {}).get("machineToken") == "tok-1",
+          (len(_c12), _i12))
+finally:
+    A.run_runtime_info = _IDC_ORIG_RUN
+    A._native_ident_cache.clear()
+    for _k in _IDC_KEYS:
+        if _IDC_ORIG_ENV[_k] is None:
+            os.environ.pop(_k, None)
+        else:
+            os.environ[_k] = _IDC_ORIG_ENV[_k]
+    _sh35.rmtree(_IDC_TMP, ignore_errors=True)
 
 print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
