@@ -154,9 +154,6 @@ a:hover{text-decoration:underline}
 .realm-badge-intl{color:#0369a1;background:rgba(2,132,199,.12);border:1px solid rgba(2,132,199,.3);padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
 .realm-badge-cn{color:#b91c1c;background:rgba(220,38,38,.12);border:1px solid rgba(220,38,38,.3);padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
 .badge-effort{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;line-height:1.4;white-space:nowrap;margin:1px 2px;background:rgba(124,58,237,.12);color:var(--think);border:1px solid rgba(124,58,237,.3);font-weight:600}
-.realm-filter{display:inline-flex;gap:6px;margin-left:8px}
-.realm-filter button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);padding:3px 9px;font-size:11px}
-.realm-filter button.active{border-color:var(--accent);color:var(--accent);background:#fff}
 
 .realm-card{
   background:var(--panel);border:1px solid var(--line);border-radius:12px;
@@ -875,7 +872,6 @@ async function pollLogin(){
 
 window.ACTIVE_GATEWAY_REALM = "intl";
 window.VIEW_REALM = "intl";
-window.REALM_FILTER = "all";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
@@ -1041,7 +1037,7 @@ async function toggleActiveGatewayRealm(){
     await loadModels();
     await refresh();
   }catch(e){
-    alert("切换失败: " + e.message);
+    toast("切换失败: " + e.message, "bad");
   }
 };
 
@@ -1491,7 +1487,7 @@ async function runGrowthTasks(btn){
     toast("全部福利领取完成" + sumC + (proMsg ? ('；Pro: ' + proMsg.slice(0, 60)) : '') + "！");
   }catch(e){
     if(logBox) logBox.innerHTML += '<div style="color:var(--warn)">执行出错: ' + esc(e.message) + '</div>';
-    alert("任务执行失败: " + e.message);
+    toast("任务执行失败: " + e.message, "bad");
   }finally{
     btn.disabled = false;
     btn.textContent = oldText;
@@ -1562,13 +1558,7 @@ async function toggleScheduler(btn){
     if(btn){ btn.disabled = false; }
   }
 }
-function filterRealm(m){
-  REALM_FILTER = m;
-  document.getElementById("fltAll").className = m === "all" ? "active" : "";
-  document.getElementById("fltIntl").className = m === "intl" ? "active" : "";
-  document.getElementById("fltCn").className = m === "cn" ? "active" : "";
-  renderAccounts();
-}
+
 async function doCheckin(btn){
   btn.disabled = true; const ot = btn.textContent; btn.textContent = "签到中...";
   try {
@@ -1642,9 +1632,34 @@ function authHeaders(base){
   return h;
 }
 
+// 面板鉴权失败的统一处理：401 与 403 语义完全不同，绝不可并作一谈。
+//   401 = 面板会话无效/过期 → 弹登录遮罩（正确行为）。
+//   403 = 会话有效但被服务端策略拒绝（例如仍在使用默认密码时禁止读取明文 API Key）
+//         → 保留会话、绝不弹遮罩，把服务端 error.message 原样抛出，
+//           由调用处的 toast 展示可操作的原因。
+// 参数契约（响应流只能被消费一次，务必看清）：
+//   · 传了 parsedBody ⇒ 视为「响应流已被消费」：本函数绝不触碰 body，直接用传入对象取 error.message
+//                       （postJSON 已 await r.text()，此处若再 r.json() 会抛 body stream already read）
+//   · 未传 parsedBody ⇒ 视为「流未被消费」：403 分支由本函数 await r.json() 兜底
+//                       （getJSON / downloadExport 走这条，它们在状态判定前不读 body）
+async function throwPanelAuthError(r, parsedBody){
+  if(r.status === 401){
+    panelNeedsLogin();
+    throw new Error('unauthorized');
+  }
+  if(r.status === 403){
+    let body = parsedBody;
+    if(body === undefined){
+      try { body = await r.json(); } catch(e) { body = null; }
+    }
+    const msg = (body && body.error && body.error.message) || '服务端拒绝了该操作（403）';
+    throw new Error(msg);
+  }
+}
+
 async function getJSON(url){
   const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
   return r.json();
 }
@@ -1654,7 +1669,7 @@ async function postJSON(url, body){
   const t = await r.text();
   let parsed = {};
   try { parsed = t ? JSON.parse(t) : {}; } catch(e) { parsed = {raw: t}; }
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  await throwPanelAuthError(r, parsed);   // 403 复用已解析的 body，不二次读取
   if(!r.ok) throw new Error((parsed.error && parsed.error.message) || r.status);
   return parsed;
 }
@@ -1889,7 +1904,7 @@ async function downloadExport(query, fallbackLabel){
   // A plain <a href> would not carry the X-Panel-Token header, so a
   // password-only session would be rejected.
   const r = await fetch('/accounts/export' + (query || ''), {cache:'no-store', headers: authHeaders()});
-  if(r.status === 401 || r.status === 403){ panelNeedsLogin(); throw new Error('unauthorized'); }
+  await throwPanelAuthError(r);
   if(r.status === 404){
     let msg = '账号不存在';
     try{ const e = await r.json(); msg = (e.error && e.error.message) || msg; }catch(_){}
