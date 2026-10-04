@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.9-2496ED?style=flat-square" alt="Version 1.2.9">
+  <img src="https://img.shields.io/badge/Release-v1.2.10-2496ED?style=flat-square" alt="Version 1.2.10">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -117,6 +117,10 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 - **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
 - **配置参数**：环境变量 `API_KEY`、`PORT`（监听端口，默认 8790）、`HOST`（监听地址，默认 127.0.0.1；容器内如需对外暴露设为 0.0.0.0）。
+
+> **设备身份稳定性（issue #18 实测）**：容器里的机器身份是**「容器级」**的——默认 `bridge` 网络下**重启即换**（含 `docker compose restart` 与宿主机重启后自动拉起），任何网络模式下**重建即换**。若你依赖「每台设备每日限领」这类按设备去重的规则，建议用 `network_mode: host`（代价：不能用 `ports:` 映射，容器直接监听目标端口；**切换前请确认目标端口在宿主机上空闲，否则容器会启动失败**），并**避免高频重建**（如每天自动 pull）。注意：**推理 / API 链路不受影响**，它用的是按账号 UID 派生的身份。
+>
+> 该方案已在 **amd64 与 arm64** 两种架构、以及真实官方镜像 + 真实 compose 配置下验证过（issue #18 与我们的独立复现）。
 
 ---
 
@@ -379,6 +383,29 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.10
+
+**✨ 新增功能**：无
+
+**🐛 问题修复**：无
+
+**🎨 体验优化**：无
+
+**⚠️ 其他变更**
+
+**测试**
+- 新增端到端回归 `_test_leak_guard.py`（来自 PR #17，by @849506054）：把真实生产泄漏形态喂进 `recover_leaked_tool_calls()` 走**完整 SSE 管线**，再按客户端视角断言「到底看到了什么」——补上判据层覆盖不到的**管线接线层**（v1.2.7 那个重复输出正是这一层的缺陷）。含 5 个泄漏形态 + 3 条误伤用例，可在发布镜像内直接跑（纯标准库、无 fixture）。
+
+**文档（issue #18 @Tinkler-i 的对照实验 + issue #10 的补充实测）**
+- 「已知限制」的容器身份条目**更正**：默认 `bridge` 下 `stop/start`（含 `compose restart`、宿主机重启自动拉起）**也会换**；`network_mode: host` 下**不变**；**任何网络模式重建都换**（compose 层无法固定）。并标注影响面：只有活动/签到链路用到真身份，**推理链路用的是按 UID 派生的身份、不受影响**。
+- Docker 部署段落补实践建议：用 `network_mode: host`（**切换前确认端口空闲**，否则容器启动失败）、避免高频重建；该方案已在 **amd64 / arm64 双架构**、真实官方镜像 + 真实 compose 下验证。
+- 「已知限制」补：**Linux 实体机也可能 `isVm=true`**；`vmInfo` **只用于本地诊断、不上行**。
+- 「已知限制」补 intl 每日 100 的「**下发 vs 领取**」区分：**下发**绑定设备（由官方客户端登录的那台机器决定），而**领取不校验机器头**——因此网关侧无法为其余账号「制造」该活动，需要另一台物理机器。
+
+**验证**
+- 独立复现 issue #18 的四条结论（Windows + Docker Desktop / WSL2 后端，与作者的 Linux 环境逐条一致），并补两个对照：**`compose restart` 与 `stop/start` 在身份效果上等价**、**host 网络下重建同样会换**；
+- PR #17 的回归在本地实跑：10 checks / 10 passed / 0 failed。
 
 ### v1.2.9
 
@@ -707,6 +734,7 @@ python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID �
 >
 > - ✅ 它解决的是「**Linux/Docker 部署拿不到真身份**」——提取后活动列表可见、可正常领取；
 > - ❌ 它**不能**解决「同一台机器上多个国际版账号都能领」——上游对同一机器身份是**按设备去重**的（「每台设备每日仅 1 个国际版账号可领」）。要让多个账号各自可领，需要**不同的机器 / 不同的物理指纹**，这不是提取组件这一层能改变的。
+> - 📌 **「下发」与「领取」是两件事**（issue #10 的补充实测）：能不能**看到**这条活动**绑定的是设备**（由官方客户端登录过的那台机器决定），而点下去**领取时不校验机器头**。所以网关侧无法为其余账号「制造」出这条活动——需要**另一台物理机器**跑一次官方 PC 端登录。重建容器换身份在这件事上**没有用武之地**（下发发生在客户端登录那一刻，不在网关请求时刻）。
 
 > 国内版不受此限制：它只需要宿主头（`Authorization` + `Cosy-ClientType: 10` + `User-Agent: Qoder` + `Accept`），不需要任何 `Cosy-Machine*`。
 >
@@ -714,9 +742,16 @@ python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID �
 
 **Docker / 容器部署的补充实测（issue #12，社区实测）**：
 
-- **容器里的身份是「容器级」而不是机器级**：同一容器内多次调用身份字段逐字节一致，但**每新建一个容器就会换一套身份**（两个独立容器结果不同）。含义：`docker compose up -d --build` 这类**重建**会更换设备身份，上游按设备去重的「每台设备每日 1 个国际版账号可领」会因此意外变化（重建后可能被当作「新设备」）。需要身份稳定时请**复用同一容器**（`docker start` / `docker compose start`，而不是重建）。
+- **容器里的身份是「容器级」而不是机器级**：同一容器内多次调用身份字段逐字节一致，但 **并非所有「复用容器」都能保住身份**（对照实验见 issue #18）：
+  - **默认 `bridge` 网络**下，`docker stop` + `docker start`（含 `docker compose restart`、宿主机重启后自动拉起）**也会换一套**——bridge 容器停止时网络端点即被销毁（Docker 官方文档原话：「Stopped containers lose their IP addresses.」）；
+  - **`network_mode: host`** 下同样的 stop/start **保持不变**（共享宿主网络栈、不分配独立 IP）；
+  - **升级/重建容器**（`docker compose up -d --build`、`pull && up -d`）在**任何网络模式**下都会更换——身份里含一个「每容器独有」的量，compose 层无法固定（实测：两个容器即使 hostname / MAC / IP / 网络全相同，身份仍不同；单独固定其中任何一项均无效）；
+  - **影响面**（别夸大）：只有**活动 / 签到**链路会用到这个真身份；**推理 / API 链路用的是按账号 UID 派生的身份，完全不受影响**；
+  - 因此：想稳住「重启」请用 `network_mode: host`；想连「升级」都不换，只能在宿主机直跑（或把代码挂载进容器、升级只同步文件 + restart）；否则建议**避免「每天自动 pull」这类高频重建**。
 - **alpine 镜像需要 glibc 兼容层**：提取出的组件是 glibc 动态链接的 ELF（依赖 `libstdc++`），而 alpine 是 musl——缺 `/lib64/ld-linux-x86-64.so.2` 与 `libstdc++.so.6` 时 exec 会直接失败（`exit 127`，观感像「文件不存在」，实为组件在但跑不起来）。本仓 Dockerfile 已内置 `apk add gcompat libstdc++ libgcc`（约 +3.1 MB）；自建镜像请照做。这类执行失败现在会在 stderr 打印一次 `[runtime-info] 无法执行 …`，与「组件不存在」的静默回退可区分。
 - **虚拟化字段的写法**：组件返回的 `vmInfo.brand` **不是固定值**（实测：一次性容器里可能是 `Docker`、完整构建的镜像里可能是 `KVM`）——判断虚拟化只看 `isVm`（或 `vmTypeCode`），不要把 `brand` 当常量引用。
+  - 另外，**Linux 实体机也可能 `isVm=true`**（实测物理机上返回 `isVm=true, brand=KVM, percentage=85`；Windows 侧则是 VBS/HVCI 误报）——**不要用该字段推断「是不是虚拟机」**。
+  - `vmInfo` **只在本地诊断使用**（看板卡片 / `_diag_campaign.py` / `/diag/vm`），**不上行**，不影响请求链路。
 - **一条已被证实的路径**：让组件真正可执行（装兼容包）后，国内版「新人任务」活动从**不可见变为可见**——v1.2.1 当时标注「未验证」的「真机器头可能额外解锁设备定向活动」由此被社区实测证实。
 
 ### 2. 官方 fixture 缺失时部分密码学 KAT 会跳过
