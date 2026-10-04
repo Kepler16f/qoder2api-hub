@@ -129,9 +129,12 @@ def desktop_version():
 # 服务端**按这些值过滤设备定向活动**：派生的假身份不会报错，但活动列表里
 # 会静默少掉"每日领取 100 Credits"这类条目（实测：换用原生身份后立刻出现
 # CLAIMABLE 活动）。因此网关优先调用同一个官方二进制取真值，失败才回退派生值。
-# 原生身份缓存：身份会随时间轮换，但**旧身份仍被服务端接受**（实测复用 25s+
-# 依然 showCampaign=true），真正的成本是每次强制刷新要跑 3.7 秒的官方二进制。
-# 因此做长缓存（30 分钟），并用"列表被判为未认可时刷新重试一次"兜底自愈。
+# 原生身份缓存：组件的输出由**种子文件** $HOME/.config/.locale_cfg 决定——
+# 同一种子下重复调用返回同一个身份（#18 实测：69 分钟 24 次采样不变），
+# 换身份只能靠"清种子 + 重调组件"（见 _purge_identity_seed）。旧身份长期被
+# 服务端接受（实测复用 25s+ 依然 showCampaign=true），真正的成本是每次调
+# 组件要跑约 3.7 秒的官方二进制。因此做长缓存（30 分钟）+ 落盘缓存，并用
+# "列表被判为未认可时清种子换新身份重试一次"兜底自愈。
 # 注意：身份是**机器级**的（不同账号/不存在的账号 id 都返回同一份），
 # 因此按区域缓存即可，同一台机器上的多个账号共用是正确的。
 NATIVE_IDENTITY_TTL = 1800
@@ -358,7 +361,12 @@ def _identity_cache_enabled():
 
 
 def _identity_cache_ttl():
-    """QD_MACHINE_IDENTITY_CACHE_TTL：秒；0（默认）＝不过期。"""
+    """QD_MACHINE_IDENTITY_CACHE_TTL：秒；0（默认）＝不过期。
+
+    正数=到期后清组件种子并重取（**真的换出新身份**，见 _purge_identity_seed）
+    ——这是设计 §3.3 的"定期轮换"开关；到期只是重新调组件、不换种子的话，
+    同种子下会拿回同一个身份，开关等于没生效。
+    """
     try:
         ttl = float(os.environ.get("QD_MACHINE_IDENTITY_CACHE_TTL") or 0)
     except (TypeError, ValueError):
@@ -446,6 +454,18 @@ def _load_identity_cache(realm, now, allow_expired=False):
     return ident
 
 
+def _identity_cache_expired_entry_exists(realm, now):
+    """落盘存在该 realm 的**有效条目**、但已按 TTL 过期（TTL 轮换路径专用）。
+
+    用于区分"首次无缓存/损坏"与"TTL 到期"：只有后者才在重取前清组件种子
+    （让"定期轮换"真的换出新身份，见 _purge_identity_seed）。
+    """
+    entry = (_read_identity_cache_doc().get("realm") or {}).get(realm)
+    if entry is None or _identity_entry_to_ident(entry) is None:
+        return False
+    return _identity_entry_expired(entry, _identity_cache_ttl(), now)
+
+
 def _write_identity_cache_doc(doc):
     """原子写缓存文档（临时文件 + os.replace、权限 0600）；失败静默返回 False。"""
     path = machine_identity_cache_path()
@@ -500,6 +520,27 @@ def _save_identity_cache(realm, ident, force=False):
         return None
 
 
+def _purge_identity_seed():
+    """删除组件的身份种子 $HOME/.config/.locale_cfg；缺失即忽略、异常不外抛。
+
+    组件输出由该随机种子决定（#18 实测：同种子下重复调用返回同一身份，
+    删种子后必换新身份并写回新种子）。只有三条**显式换身份**路径才清它：
+    ① force 自愈（否则拿到还是被拒的同一个身份，自愈空转）；②
+    QD_MACHINE_IDENTITY_RESET（用户主动换）；③ TTL 到期后的那次调用
+    （定期轮换——不换种子这个开关就是空的）。其它路径（缓存命中、组件
+    失败回退、首次无缓存获取）绝不动，否则「重建不换」的缓存会失去意义。
+    返回是否真的删除了文件；任何失败都静默（身份拿不到才是大事故）。
+    """
+    try:
+        path = os.path.join(os.path.expanduser("~"), ".config", ".locale_cfg")
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _consume_identity_reset():
     """QD_MACHINE_IDENTITY_RESET=1：清空落盘缓存（进程内只消费一次）。
 
@@ -522,6 +563,9 @@ def _consume_identity_reset():
         except OSError as exc:
             _identity_cache_log(
                 "WARN", "could not clear machine identity cache: %s" % exc)
+    # 主动换身份必须连种子一起换：只清缓存会复刻出一个**完全相同**的身份
+    # （#18：身份由种子决定），等于没换。
+    _purge_identity_seed()
 
 
 def native_machine_identity(realm, account_id, force=False):
@@ -531,12 +575,15 @@ def native_machine_identity(realm, account_id, force=False):
     NATIVE_IDENTITY_TTL 秒；force=True 跳过缓存重新取值（服务端明确拒绝时的
     自愈路径才用它——见设计 §9.1）。
 
-    落盘缓存（issue #18）：组件每次调用都会给出**新**身份，所以本实现是
-    **缓存优先**——落盘命中就不调组件，Docker 重建/升级容器后身份不变；
-    组件不可用时回退落盘缓存（哪怕过期），不再被迫退化到 derived 假身份。
+    落盘缓存（issue #18）：组件输出由本机种子文件（$HOME/.config/.locale_cfg）
+    决定——同一种子下重复调用返回**同一个**身份，删种子才换新（见
+    _purge_identity_seed）。只有**缓存优先**（落盘命中就不调组件）才能让
+    Docker 重建/升级容器后身份不变；组件不可用时回退落盘缓存（哪怕过期），
+    不再被迫退化到 derived 假身份。
     """
     now = time.time()
     cache_on = _identity_cache_enabled()
+    ttl_rotation = False
     _consume_identity_reset()
     if not force:
         # ① 内存缓存（1800s，现状不变）
@@ -555,6 +602,20 @@ def native_machine_identity(realm, account_id, force=False):
                         "machine identity cache: reusing cached identity for %s "
                         "(rebuilds keep the same device)" % realm)
                 return stored
+            # TTL 到期（有记录但已过期）＝"定期轮换"路径；与"首次无缓存"
+            # 区分开：只有它才在重取前清种子，让轮换真的换出**新身份**。
+            ttl_rotation = _identity_cache_expired_entry_exists(realm, now)
+    # 清种子的三条路径（后来人最容易漏第三条）：
+    #   ① force=True：服务端已不认当前身份 → 自愈必须换一个**新的**
+    #      （同种子下组件只会返回同一个被拒身份，不换种子等于自愈空转）；
+    #   ② QD_MACHINE_IDENTITY_RESET=1：用户主动换
+    #      （在 _consume_identity_reset 里处理：缓存与种子一起清）；
+    #   ③ TTL 到期后的这次调用：让"定期轮换"开关真的生效——不换种子它
+    #      只是重新调一次组件、拿回同一个身份，等于空开关。
+    # 不清种子的路径：缓存命中（根本不调组件）、组件失败回退缓存、首次无
+    # 缓存的正常获取（那时用户并没有要求换身份）。
+    if force or ttl_rotation:
+        _purge_identity_seed()
     # ③ 调组件
     ident = {}
     data = run_runtime_info(realm, account_id)
@@ -1312,8 +1373,9 @@ class Account(object):
         **真实机器身份**（原生桥取，见 `native_machine_identity`）。两者任一
         不对都表现为 HTTP 200 + 列表里少活动（不报错），这正是"领不到"的根因。
 
-        机器身份会轮换：若本次 `showCampaign=false`（通常意味着身份被判定为
-        非官方客户端），强制刷新一次身份并重试，避免缓存过期导致整天领不到。
+        身份被拒时的自愈：若本次 `showCampaign=false`（通常意味着身份被判定为
+        非官方客户端），清掉组件种子、强制换一个**新的**身份并重试，避免被拒
+        的身份一直卡到重建容器（#18：同种子下组件只会返回同一个身份）。
         结果短缓存 CAMPAIGNS_TTL 秒（force=True 绕过）——该请求是上游最慢的
         一环，看板切换视图时不该重复等它。
 
@@ -1502,8 +1564,9 @@ class Account(object):
     def campaign_checkin(self, gap=None, only_kinds=None):
         """活动平台签到：领取所有 CLAIMABLE 的 Credits 活动（每日 100 等）。
 
-        先强制刷新原生机器身份（身份会轮换，缓存过期会让列表被过滤 → 漏领），
-        再列活动、逐个领取。多账户场景下每个账号独立走这一遍。
+        先取一次机器身份（内存 → 落盘 → 组件；**不**强制换新——避免把
+        「重建不换」的落盘缓存刷掉，设计 §9.1），再列活动、逐个领取。
+        多账户场景下每个账号独立走这一遍。
 
         only_kinds: 只领这些 benefit.kind 的活动（如 ("", "CREDITS") 表示只做
                     每日签到领积分，不动兑换码/券类福利）。

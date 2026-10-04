@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.15-2496ED?style=flat-square" alt="Version 1.2.15">
+  <img src="https://img.shields.io/badge/Release-v1.2.16-2496ED?style=flat-square" alt="Version 1.2.16">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -133,10 +133,13 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 > 网关会把官方组件**首次输出的**身份缓存到 `accounts/machine_identity.json`，之后**优先复用**：重建、升级、重启容器后设备身份**保持不变**。
 >
 > - **前提**：`accounts/` **必须是挂载卷**（不挂卷时缓存写在容器内部、随容器消亡，等于没缓存）；
-> - 缓存的是**官方组件自己的输出**，不是伪造；组件本身仍保持官方「不落状态文件」的行为；
+> - 缓存的是**官方组件自己的输出**，不是伪造；
+> - ⚠️ **更正（v1.2.16，据 issue #18 的实测）**：组件**会**落状态文件 —— 它在 `$HOME/.config/.locale_cfg`（350 B）里存一个**随机种子**，身份由「该种子 + 机器证据 + 容器证据」共同决定。**「想换身份」本质上就是换这个种子**（我们之前「组件不落状态文件」的说法是错的）；
+> - **机制（三输入模型）**：`identity = f(种子[, $HOME/.config/.locale_cfg], 机器证据[DMI / CPU / …], 容器证据[/proc/mounts 的 overlay 行、网卡 MAC])` —— 这解释了两件事：**同一容器内身份恒定**（种子不变，实测 69 分钟 24 次采样无变化），而**重建容器会换**（overlay 行变，compose 层盖不住）；
 > - **想主动换身份**：删除 `accounts/machine_identity.json`（或启动时设 `QD_MACHINE_IDENTITY_RESET=1` 跑一次）；
 > - **不想启用**：`QD_MACHINE_IDENTITY_CACHE=off`（回到旧行为）；
-> - **想定期轮换**：`QD_MACHINE_IDENTITY_CACHE_TTL=<秒>`（默认 `0`＝不过期）。⚠️ **设了它就会按周期换成新身份**，重建后身份也随之改变；
+> - **想定期轮换**：`QD_MACHINE_IDENTITY_CACHE_TTL=<秒>`（默认 `0`＝不过期）。到期后会**清掉组件种子并取一个新身份**（**真的换**，不是重读一遍同一个值），重建后身份也随之改变；
+> - **三条会自动「换身份」的路径**：① 服务端不认当前身份时的**自愈**（`campaigns()` 判 `showCampaign=false`）；② **`QD_MACHINE_IDENTITY_RESET=1`**（或直接删缓存文件）；③ **TTL 到期**。**其余路径一律不碰种子** —— 否则「重建不换」会被自己削弱；
 > - 若服务端某天不再接受该身份，既有**自愈**会在活动列表被判「未认可」时刷新并**更新缓存**（日志有 WARN 提示）；
 > - ⚠️ 该文件代表**物理机器的身份**，**不要跨机器共享 `accounts/`**；顺带一提，组件不可用时（如 alpine 缺兼容层）现在也能**继续用真身份**，而不是退化成派生假身份。
 >
@@ -424,6 +427,31 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.16
+
+**✨ 新增功能**：无
+
+**🐛 问题修复**
+- **服务端「不认身份」时的自愈此前是空转**（据 issue #18 的实测）：自愈会清掉缓存并重新调用官方组件，但**同一容器内组件返回的是同一个身份** —— 它拿到的正是刚才那个被拒的身份，账号会一直卡到容器重建为止。
+  - 根因：组件身份由它自己写的**随机种子文件** `$HOME/.config/.locale_cfg`（350 B）决定，**不随时间轮换**（实测：同一容器内 69 分钟 24 次采样、以及我们自己的 10 分钟 11 次采样，身份均完全不变）；
+  - 现在：自愈会**先清种子再取身份**（实测由此必得新身份）。
+- **`QD_MACHINE_IDENTITY_RESET=1` 此前换不出身份**：它只清了缓存、种子没动 → 组件会给出**完全相同**的身份。现在也一并清种子。
+- **`QD_MACHINE_IDENTITY_CACHE_TTL` 此前是空开关**：到期只是重新调一次组件、拿到同一个身份。现在 TTL 到期会清种子并取新身份 —— **这个开关从此真的能轮换**。
+
+**🎨 体验优化**：无
+
+**⚠️ 其他变更**
+- **更正两处被实测证伪的说法**（原写在 v1.2.13 的说明与文档里）：
+  1. 「组件本身不落状态文件」—— **错**。它会落 `$HOME/.config/.locale_cfg`（随机种子）；
+  2. 「身份会随时间轮换」—— **错**。同一容器内身份恒定，**换身份的本质是换种子**。
+- 文档补上**三输入模型**：`identity = f(种子, 机器证据[DMI / CPU]，容器证据[overlay 挂载行、网卡 MAC])` —— 同时解释了「同一容器内恒定」与「重建必换」；
+- 三条「会自动换身份」的路径写进文档：**自愈 / `RESET` / TTL 到期**；**其余路径一律不碰种子**（否则「重建不换」会被自己削弱）。
+
+**验证**
+- 种子机制：**删种子 → 身份必变**；保留种子 → 同一容器内恒定（我们 10 分钟 11 次 + 对方 69 分钟 24 次，双环境一致）；
+- 三路径闭环（WSL 真机、真组件 + 真种子 + 真缓存）：首次**不清**种子 ✓ ／ TTL 到期**清**且身份**真的变了** ✓ ／ 缓存命中**不碰** ✓；
+- 全量 **626 checks / 0 failed**。
 
 ### v1.2.15
 
@@ -900,6 +928,7 @@ python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID �
   - **`network_mode: host`** 下同样的 stop/start **保持不变**（共享宿主网络栈、不分配独立 IP）；
   - **升级/重建容器**（`docker compose up -d --build`、`pull && up -d`）在**任何网络模式**下都会更换——身份里含一个「每容器独有」的量，compose 层无法固定（实测：两个容器即使 hostname / MAC / IP / 网络全相同，身份仍不同；单独固定其中任何一项均无效）；
     - ✅ **v1.2.13 起由「机器身份落盘缓存」根治**（默认启用）：网关把组件首次输出的身份缓存到 `accounts/machine_identity.json`，之后优先复用——**重建/升级容器后身份不变**（前提：`accounts/` 是挂载卷）。详见 Docker 部署段落的 ①；
+    - 补充（v1.2.16）：**「重建后不变」与「该换时要换得掉」是两件事**，分别由「落盘缓存」与「换组件种子」保证。同一个容器内组件身份**恒定**（种子不变），所以服务端不认时的自愈**必须清种子**才有效——见 Docker 部署段落的 ①；
   - **影响面**（别夸大）：只有**活动 / 签到**链路会用到这个真身份；**推理 / API 链路用的是按账号 UID 派生的身份，完全不受影响**；
   - 因此：想稳住「重启」请用 `network_mode: host`；想连「升级」都不换，只能在宿主机直跑（或把代码挂载进容器、升级只同步文件 + restart）；否则建议**避免「每天自动 pull」这类高频重建**。
 - **alpine 镜像需要 glibc 兼容层**：提取出的组件是 glibc 动态链接的 ELF（依赖 `libstdc++`），而 alpine 是 musl——缺 `/lib64/ld-linux-x86-64.so.2` 与 `libstdc++.so.6` 时 exec 会直接失败（`exit 127`，观感像「文件不存在」，实为组件在但跑不起来）。本仓 Dockerfile 已内置 `apk add gcompat libstdc++ libgcc`（约 +3.1 MB）；自建镜像请照做。这类执行失败现在会在 stderr 打印一次 `[runtime-info] 无法执行 …`，与「组件不存在」的静默回退可区分。
