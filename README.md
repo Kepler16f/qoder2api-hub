@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.11-2496ED?style=flat-square" alt="Version 1.2.11">
+  <img src="https://img.shields.io/badge/Release-v1.2.12-2496ED?style=flat-square" alt="Version 1.2.12">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -118,18 +118,22 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 - **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
 - **配置参数**：环境变量 `API_KEY`、`PORT`（监听端口，默认 8790）、`HOST`（监听地址，默认 127.0.0.1；容器内如需对外暴露设为 0.0.0.0）。
 
-> **设备身份稳定性（issue #18 实测）**：容器里的机器身份是**「容器级」**的——默认 `bridge` 网络下**重启即换**（含 `docker compose restart` 与宿主机重启后自动拉起），任何网络模式下**重建即换**。若你依赖「每台设备每日限领」这类按设备去重的规则，建议用 `network_mode: host`（代价：不能用 `ports:` 映射，容器直接监听目标端口；**切换前请确认目标端口在宿主机上空闲，否则容器会启动失败**），并**避免高频重建**（如每天自动 pull）。注意：**推理 / API 链路不受影响**，它用的是按账号 UID 派生的身份。
+> **设备身份稳定性（issue #18 实测）**：容器里的机器身份是**「容器级」**的——默认 `bridge` 网络下**重启即换**（含 `docker compose restart` 与宿主机重启后自动拉起），任何网络模式下**重建即换**。若你依赖「每台设备每日限领」这类按设备去重的规则，**推荐下面第 ① 条**，并**避免高频重建**（如每天自动 pull）。注意：**推理 / API 链路不受影响**，它用的是按账号 UID 派生的身份。
 >
-> 该方案已在 **amd64 与 arm64** 两种架构、以及真实官方镜像 + 真实 compose 配置下验证过（issue #18 与我们的独立复现）。
->
-> **更省的替代（同样只需消掉「重启就换」）**：留在默认 bridge 网络、**固定网卡 MAC**（保住 `ports:` 映射）：
+> **① 固定网卡 MAC（推荐，代价最小）** —— 留在默认 bridge 网络、**保留 `ports:` 映射**：
 > ```yaml
 > services:
 >   qoder-proxy:
 >     mac_address: "02:42:ac:11:00:77"
 >     ports: ["8790:8790"]
 > ```
-> 实测依据（issue #18 的补充实验）：bridge 下容器停止会重建 veth、MAC 随之改变，而身份同时依赖「每容器独有的量」与「网卡 MAC」——固定 MAC 即可让 `stop/start` 后身份逐字节不变（**注意：重建容器仍会换**，那一类由「每容器独有的量」决定，compose 层盖不住）。
+> 若你的 Docker 拒绝 service 级 `mac_address`（官方文档提到 Engine ≥ v25 可能拒绝；实测 Docker 29.6.1 与 29.7.2 均接受），改用 `networks.<网络名>.mac_address`。
+>
+> **② `network_mode: host`（备选）** —— 彻底共享宿主网络栈，适合宿主机端口冲突、或确实需要容器直接占用宿主端口时；代价是不能用 `ports:` 映射，且**切换前请确认目标端口在宿主机上空闲**，否则容器会启动失败。
+>
+> **机制（两输入模型）**：`identity = f(每容器独有的量, 容器网卡 MAC)` —— bridge 下容器停止会重建 veth、MAC 随之改变，而身份同时依赖这两者；固定 MAC 即可让 `stop/start` 后身份逐字节不变。**两条路都只解决「重启」这一类**：**重建容器仍会换**（由「每容器独有的量」决定，compose 层无法覆盖）。
+>
+> 以上已在 **amd64 与 arm64**、真实官方镜像 + 真实 compose 下验证（issue #18 的作者与我们的独立复现）。
 
 ---
 
@@ -392,6 +396,27 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.12
+
+**✨ 新增功能**：无
+
+**🐛 问题修复**：无
+
+**🎨 体验优化**：无
+
+**⚠️ 其他变更**
+
+**文档：把「固定网卡 MAC」提为首选方案**（issue #18 作者用真实镜像 + 真实 compose 实测后建议）
+- 「设备身份稳定性」提示改为**两条路并列且有序**：
+  - **① 固定网卡 MAC（推荐，代价最小）**：留在默认 bridge、**保留 `ports:` 映射**——`mac_address: "02:42:ac:11:00:77"`；
+  - **② `network_mode: host`（备选）**：适合宿主机端口冲突、或需要容器直接占用宿主端口时。
+- 补**兜底写法**：若 service 级 `mac_address` 被拒（官方文档提到 Engine ≥ v25 可能拒绝），改用 `networks.<网络名>.mac_address`（实测 29.6.1 / 29.7.2 均接受）。
+- 附**机制解释**（两输入模型 `identity = f(每容器独有的量, 容器网卡 MAC)`），并明确**两条路都只解决「重启」这一类**、重建容器仍会换。
+
+**验证**
+- 独立复现（Docker Desktop 29.7.2 / WSL2）：service 级 `mac_address` 被接受、实际 MAC 与设定一致、端口映射正常、restart 与 stop/start 后 token 均逐字节不变、重建仍会变——与作者的 29.6.1 / ARM 结果逐条一致；
+- 额外确认 `mac_address` 与 `ports:` 并存无冲突。
 
 ### v1.2.11
 
