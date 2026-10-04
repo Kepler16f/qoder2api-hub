@@ -99,12 +99,21 @@
 
 ### 5. Docker 容器化部署
 
+**方式一：官方预构建镜像（推荐）**。每个版本会自动构建并推送多架构（amd64 / arm64）镜像到 GHCR，升级只要 `pull`：
+
 ```bash
-# 1. 后台启动容器 (自动构建并运行)
+# 1. 拉取并启动
+docker compose pull
 docker compose up -d
 
 # 2. 查看网关日志
 docker compose logs -f
+```
+
+**方式二：从源码自行构建**。把 `docker-compose.yml` 里的 `image:` 注释掉、改用 `build: .`：
+
+```bash
+docker compose up -d --build
 ```
 
 或直接 `docker run`：
@@ -112,7 +121,7 @@ docker compose logs -f
 ```bash
 docker run -d --name qoder-proxy --restart unless-stopped \
   -p 8790:8790 -v $(pwd)/accounts:/app/accounts -v $(pwd)/usage:/app/usage \
-  -e API_KEY=your_secret_key $(docker build -q .)
+  -e API_KEY=your_secret_key ghcr.io/shuishuipingan/qoder2api-hub:latest
 ```
 
 - **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
@@ -139,6 +148,11 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 >   qoder-proxy:
 >     mac_address: "02:42:ac:11:00:77"
 >     ports: ["8790:8790"]
+> ```
+>
+> ⚠️ 上面那串 MAC **只是示例，请换成你自己生成的**，别照抄——macvlan 网络或同一宿主机跑多个实例时会撞 MAC：
+> ```bash
+> printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
 > ```
 > 若你的 Docker 拒绝 service 级 `mac_address`（官方文档提到 Engine ≥ v25 可能拒绝；实测 Docker 29.6.1 与 29.7.2 均接受），改用 `networks.<网络名>.mac_address`。
 >

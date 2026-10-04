@@ -1,9 +1,16 @@
 services:
   qoder-proxy:
-    build: .
-    image: qoder-proxy:latest
+    # 默认使用官方预构建镜像（每个版本自动构建并推送多架构 amd64/arm64 到 GHCR）。
+    # 想从源码自行构建：注释掉下面这行 image，改用 build: .
+    image: ghcr.io/shuishuipingan/qoder2api-hub:latest
+    # build: .
     container_name: qoder-proxy
     restart: unless-stopped
+    # 固定网卡 MAC：bridge 网络下容器停止会重建 veth，设备身份随之变化（issue #18），
+    # 固定后 stop/start（含宿主机重启自动拉起）身份保持不变；重建容器仍会变。
+    # ⚠️ 下面这串只是示例，请换成你自己生成的，别照抄——macvlan / 同一宿主机多实例会撞 MAC：
+    #    printf '02:42:%02x:%02x:%02x:%02x\n' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256))
+    mac_address: "02:42:ac:11:00:77"
     ports:
       # 宿主机:容器。改容器监听端口时 PORT 与这里要一起改
       - "8790:8790"
@@ -15,5 +22,12 @@ services:
       - TZ=Asia/Shanghai
     volumes:
       # 持久化挂载账号凭证与用量流水
+      # NAS / 长期部署建议改成绝对路径，避免源码目录被重装覆盖时连数据一起删掉
       - ./accounts:/app/accounts
       - ./usage:/app/usage
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8790/ping',timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
