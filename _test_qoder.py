@@ -4045,7 +4045,8 @@ import tempfile as _tf35
 import threading as _th35
 
 _IDC_KEYS = ("ACCOUNTS_DIR", "QD_MACHINE_IDENTITY_CACHE",
-             "QD_MACHINE_IDENTITY_CACHE_TTL", "QD_MACHINE_IDENTITY_RESET")
+             "QD_MACHINE_IDENTITY_CACHE_TTL", "QD_MACHINE_IDENTITY_RESET",
+             "QD_MACHINE_IDENTITY_VOTE")
 _IDC_ORIG_ENV = {_k: os.environ.get(_k) for _k in _IDC_KEYS}
 _IDC_ORIG_RUN = A.run_runtime_info
 _IDC_TMP = _tf35.mkdtemp(prefix="qd-idcache-")
@@ -4067,14 +4068,20 @@ def _idc_env(**over):
         pass
 
 
-def _idc_stub(calls, fail=False):
+def _idc_stub(calls, fail=False, seq=None):
+    """替换组件入口：记录调用次数并返回**恒定**身份（保证投票 3/3 一致）。
+
+    seq 给定时按调用序号循环取样本（用于构造多数派/全分歧场景）。
+    """
     def _f(realm, account_id=""):
         calls.append((realm, account_id))
         if fail:
             return {}
-        n = len(calls)
-        return {"machineToken": "tok-%d" % n, "machineType": "ty%d" % n,
-                "machineCode": "co%d" % n, "vmInfo": {"isVm": False}}
+        if seq:
+            s = seq[(len(calls) - 1) % len(seq)]
+            return dict(s)
+        return {"machineToken": "tok-1", "machineType": "ty1",
+                "machineCode": "co1", "vmInfo": {"isVm": False}}
     return _f
 
 
@@ -4099,8 +4106,8 @@ try:
     A.run_runtime_info = _idc_stub(_c1)
     _i1 = A.native_machine_identity("cn", "u1")
     _f1 = _idc_read()
-    check("#48-1 首次调用：无缓存 → 调组件一次并落盘（version/realm/三字段完整）",
-          len(_c1) == 1 and _i1.get("machineToken") == "tok-1"
+    check("#48-1 首次调用：无缓存 → 组件被调 **3** 次（首次表决）并落盘",
+          len(_c1) == 3 and _i1.get("machineToken") == "tok-1"
           and isinstance(_f1, dict) and _f1.get("version") == 1
           and _idc_tok(_f1) == "tok-1"
           and ((_f1.get("realm") or {}).get("cn", {}).get("machineType") == "ty1")
@@ -4139,8 +4146,9 @@ try:
     _c4b = []
     A.run_runtime_info = _idc_stub(_c4b, fail=True)
     _i4b = A.native_machine_identity("cn", "u4b")
-    check("#48-4 组件失败但落盘有（过期）缓存 → 仍返回缓存身份，且不写坏缓存文件",
-          len(_c4a) == 1 and len(_c4b) == 1
+    check("#48-4 组件失败但落盘有（过期）缓存 → 仍返回缓存身份，且不写坏缓存文件"
+          "（首次表决 3 次、TTL 轮换 1 次）",
+          len(_c4a) == 3 and len(_c4b) == 1
           and _i4b.get("machineToken") == _i4a.get("machineToken")
           and _idc_tok(_idc_read()) == _i4a.get("machineToken"),
           (_c4b, _i4b, _idc_read()))
@@ -4148,8 +4156,8 @@ try:
     _idc_env()
     _c5 = []
     A.run_runtime_info = _idc_stub(_c5, fail=True)
-    check("#48-5 组件失败且无缓存 → 返回 {}（现状不变）",
-          A.native_machine_identity("cn", "u5") == {} and len(_c5) == 1)
+    check("#48-5 组件失败且无缓存 → 表决 3 次全空 → 返回 {}（现状不变）",
+          A.native_machine_identity("cn", "u5") == {} and len(_c5) == 3)
 
     _idc_env(QD_MACHINE_IDENTITY_CACHE="off")
     _c6 = []
@@ -4171,7 +4179,8 @@ try:
         pass
     A._native_ident_cache.clear()
     A.native_machine_identity("cn", "u7b")
-    check("#48-7 TTL 正数：过期后重新调组件（缓存被刷新）", len(_c7) == 2, len(_c7))
+    check("#48-7 TTL 正数：过期后重新调组件（首次表决 3 + 轮换 1 = 4）",
+          len(_c7) == 4, len(_c7))
 
     _idc_env()
     _c8a = []
@@ -4196,8 +4205,8 @@ try:
     except Exception as _e9:
         _err9 = _e9
         _i9 = {}
-    check("#48-9 缓存文件损坏（截断 JSON）→ 不抛异常，回退调组件",
-          _err9 is None and len(_c9) == 1 and bool((_i9 or {}).get("machineToken")),
+    check("#48-9 缓存文件损坏（截断 JSON）→ 不抛异常，回退表决 3 次",
+          _err9 is None and len(_c9) == 3 and bool((_i9 or {}).get("machineToken")),
           (_err9, len(_c9)))
 
     _idc_env()
@@ -4221,7 +4230,13 @@ try:
 
     _idc_env()
     _c11 = []
-    A.run_runtime_info = _idc_stub(_c11)
+    # 桩要"两次采样给不同身份"：首次表决 3 次得 tok-a、force 刷新得 tok-b，
+    # 才能区分"只更新内存"与"落盘也被更新"。
+    A.run_runtime_info = _idc_stub(_c11, seq=[
+        {"machineToken": "tok-a", "machineType": "ty-a", "machineCode": "co-a",
+         "vmInfo": {"isVm": False}}] * 3
+        + [{"machineToken": "tok-b", "machineType": "ty-b", "machineCode": "co-b",
+            "vmInfo": {"isVm": False}}])
     A.native_machine_identity("cn", "u11")
     _tok_before11 = _idc_tok(_idc_read())
     _acc11 = A.Account({"uid": "heal48", "realm": "cn", "accessToken": "dt-x"})
@@ -4250,9 +4265,108 @@ try:
     _c12 = []
     A.run_runtime_info = _idc_stub(_c12)
     _i12 = A.native_machine_identity("cn", "u12")
-    check("#48-12 缓存字段缺失（machineToken 空）→ 视为无缓存，回退调组件",
-          len(_c12) == 1 and (_i12 or {}).get("machineToken") == "tok-1",
+    check("#48-12 缓存字段缺失（machineToken 空）→ 视为无缓存，回退表决 3 次",
+          len(_c12) == 3 and (_i12 or {}).get("machineToken") == "tok-1",
           (len(_c12), _i12))
+
+    check("#48-13a 表决上限常量：IDENTITY_VOTE_ROUNDS=3 + EXTEND=2 → 上限 5（延迟有界）",
+          getattr(A, "IDENTITY_VOTE_ROUNDS", None) == 3
+          and getattr(A, "IDENTITY_VOTE_EXTEND_ROUNDS", None) == 2,
+          (getattr(A, "IDENTITY_VOTE_ROUNDS", None),
+           getattr(A, "IDENTITY_VOTE_EXTEND_ROUNDS", None)))
+
+    # ---- 13 表决：3 次同值 → 组件被调 3 次并采纳（不补投） ----
+    _idc_env()
+    _c13 = []
+    A.run_runtime_info = _idc_stub(_c13)
+    _i13 = A.native_machine_identity("cn", "v13")
+    check("#48-13 表决·**3/3 一致时不补投**（延迟有界：11s 档）→ 组件恰好被调 3 次并采纳",
+          len(_c13) == 3 and _i13.get("machineToken") == "tok-1", (len(_c13), _i13))
+
+    # ---- 14 表决：含分歧 → 采纳多数派【完整样本】(自适应实现会补投到 5 次) ----
+    _idc_env()
+    _maj14 = {"machineToken": "tok-maj", "machineType": "ty-maj", "machineCode": "co-maj",
+              "vmInfo": {"isVm": True, "brand": "KVM", "vmTypeCode": 13}}
+    _min14 = {"machineToken": "tok-min", "machineType": "ty-min", "machineCode": "co-min",
+              "vmInfo": {"isVm": True, "brand": "Docker", "vmTypeCode": 50}}
+    _c14 = []
+    A.run_runtime_info = _idc_stub(_c14, seq=[_maj14, _maj14, _min14, _min14, _maj14])
+    _i14 = A.native_machine_identity("cn", "v14")
+    _vm14 = _i14.get("vm_info") or {}
+    check("#48-14 表决·前 3 轮有分歧 → **补投到 5 次**，采纳多数派**完整样本**"
+          "（type/code/vmInfo 自洽不杂交）",
+          _i14.get("machineToken") == "tok-maj"
+          and _i14.get("machineType") == "ty-maj"
+          and _i14.get("machineCode") == "co-maj"
+          and _vm14.get("brand") == "KVM" and _vm14.get("vmTypeCode") == 13
+          and len(_c14) == 5, (len(_c14), _i14, _c14))
+
+    # ---- 15 表决：全分歧 → 取首个样本（确定性） ----
+    _idc_env()
+    _s15 = [{"machineToken": "t-a", "machineType": "ty-a", "machineCode": "co-a",
+             "vmInfo": {"isVm": True, "brand": "KVM", "vmTypeCode": 13}},
+            {"machineToken": "t-b", "machineType": "ty-b", "machineCode": "co-b",
+             "vmInfo": {"isVm": True, "brand": "Docker", "vmTypeCode": 50}},
+            {"machineToken": "t-c", "machineType": "ty-c", "machineCode": "co-c",
+             "vmInfo": {"isVm": True, "brand": "Xen", "vmTypeCode": 7}}]
+    _c15 = []
+    A.run_runtime_info = _idc_stub(_c15, seq=_s15)
+    _i15 = A.native_machine_identity("cn", "v15")
+    check("#48-15 表决·全分歧：取**首个**样本（确定性，不杂交）",
+          _i15.get("machineToken") == "t-a" and _i15.get("machineType") == "ty-a",
+          (len(_c15), _i15))
+
+    # ---- 16 VOTE=0 → 跳过表决，只调一次 ----
+    _idc_env(QD_MACHINE_IDENTITY_VOTE="0")
+    _c16 = []
+    A.run_runtime_info = _idc_stub(_c16)
+    _i16 = A.native_machine_identity("cn", "v16")
+    check("#48-16 QD_MACHINE_IDENTITY_VOTE=0 → 跳过表决，组件只被调 1 次",
+          len(_c16) == 1 and _i16.get("machineToken") == "tok-1", (len(_c16), _i16))
+
+    # ---- 17 force → 不表决（单次） ----
+    _idc_env()
+    _c17 = []
+    A.run_runtime_info = _idc_stub(_c17)
+    _i17 = A.native_machine_identity("cn", "v17", force=True)
+    check("#48-17 force=True：不表决（单次），但仍写入两份缓存",
+          len(_c17) == 1 and _i17.get("machineToken") == "tok-1"
+          and _idc_tok(_idc_read()) == "tok-1", (len(_c17), _idc_read()))
+
+    def _s18(_tag, _brand, _type_code):
+        return {"machineToken": "tok-" + _tag, "machineType": "ty-" + _tag,
+                "machineCode": "co-" + _tag,
+                "vmInfo": {"isVm": True, "brand": _brand, "vmTypeCode": _type_code}}
+
+    # ---- 18 补投·4:1：前 3 轮分歧 → 补到 5，采纳 4 票多数派 ----
+    _idc_env()
+    _A18, _B18 = _s18("a", "KVM", 13), _s18("b", "Docker", 50)
+    _c18 = []
+    A.run_runtime_info = _idc_stub(_c18, seq=[_A18, _A18, _B18, _A18, _A18])
+    _i18 = A.native_machine_identity("cn", "v18")
+    check("#48-18 补投·4:1 → 组件被调 **5** 次、采纳 4 票的完整样本（A）",
+          len(_c18) == 5 and _i18.get("machineToken") == "tok-a"
+          and (_i18.get("vm_info") or {}).get("brand") == "KVM", (len(_c18), _i18))
+
+    # ---- 19 补投·3:2：同样补到 5，采纳 3 票多数派 ----
+    _idc_env()
+    _c19 = []
+    A.run_runtime_info = _idc_stub(_c19, seq=[_A18, _A18, _B18, _A18, _B18])
+    _i19 = A.native_machine_identity("cn", "v19")
+    check("#48-19 补投·3:2 → 组件被调 **5** 次、采纳 3 票的完整样本（A）",
+          len(_c19) == 5 and _i19.get("machineToken") == "tok-a"
+          and (_i19.get("machine_code") or _i19.get("machineCode")) == "co-a",
+          (len(_c19), _i19))
+
+    # ---- 20 补投·平票：2/2/1 无多数 → 取首个样本 ----
+    _idc_env()
+    _C20 = _s18("c", "WSL", 7)
+    _c20 = []
+    A.run_runtime_info = _idc_stub(_c20, seq=[_A18, _A18, _B18, _B18, _C20])
+    _i20 = A.native_machine_identity("cn", "v20")
+    check("#48-20 补投·平票(2/2/1) → 组件被调 **5** 次、无多数时取**首个**样本（A）",
+          len(_c20) == 5 and _i20.get("machineToken") == "tok-a"
+          and (_i20.get("vm_info") or {}).get("brand") == "KVM", (len(_c20), _i20))
 finally:
     A.run_runtime_info = _IDC_ORIG_RUN
     A._native_ident_cache.clear()

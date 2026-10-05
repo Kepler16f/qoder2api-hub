@@ -138,6 +138,14 @@ def desktop_version():
 # 注意：身份是**机器级**的（不同账号/不存在的账号 id 都返回同一份），
 # 因此按区域缓存即可，同一台机器上的多个账号共用是正确的。
 NATIVE_IDENTITY_TTL = 1800
+# 首次落盘前的**自适应**多数表决（#18 补充：组件的 VM 判定会抖到另一分支
+# KVM/13 ↔ Docker/50——报告者实测 1.56%，本机复现 10.29%；单次采样会把用户
+# 永久固定到少数派）。先投 IDENTITY_VOTE_ROUNDS 次：全一致直接采纳；出现
+# 分歧再补 IDENTITY_VOTE_EXTEND_ROUNDS 次（上限 5，首次延迟有界）。
+# 轮数按**最坏抖动率**选：10% 抖动下 3 轮误判≈2.7%，自适应到 5 轮≈0.85%。
+# 表决只在"首次无可用缓存"这一次发生；可用 QD_MACHINE_IDENTITY_VOTE=0 关闭。
+IDENTITY_VOTE_ROUNDS = 3
+IDENTITY_VOTE_EXTEND_ROUNDS = 2
 # machine_identity_source（及 campaigns().identity）的合法取值只有两种：
 #   "runtime-info" —— runtime-info.exe 原生桥给出真身份（native_machine_identity）
 #   "derived"      —— 无原生桥时的派生回退（desktop_headers）
@@ -360,6 +368,15 @@ def _identity_cache_enabled():
     return value not in ("off", "0", "false", "no", "disable", "disabled")
 
 
+def _identity_vote_enabled():
+    """QD_MACHINE_IDENTITY_VOTE：默认开启；0/off 跳过首次表决（只调一次组件）。
+
+    给"不在乎这 1~2% 抖动、想要最快首启"的用户——首启表决约需 3×组件耗时。
+    """
+    value = (os.environ.get("QD_MACHINE_IDENTITY_VOTE") or "1").strip().lower()
+    return value not in ("off", "0", "false", "no", "disable", "disabled")
+
+
 def _identity_cache_ttl():
     """QD_MACHINE_IDENTITY_CACHE_TTL：秒；0（默认）＝不过期。
 
@@ -568,6 +585,110 @@ def _consume_identity_reset():
     _purge_identity_seed()
 
 
+def _sample_identity(realm, account_id):
+    """单次调用组件并构造 ident dict；组件无输出或字段不全时返回 {}。"""
+    data = run_runtime_info(realm, account_id)
+    if not data:
+        return {}
+    token = str(data.get("machineToken") or "").strip()
+    mtype = str(data.get("machineType") or "").strip()
+    code = str(data.get("machineCode") or "").strip()
+    vm_info = data.get("vmInfo") if isinstance(data.get("vmInfo"), dict) else {}
+    if not (token and mtype and code):
+        return {}
+    return {"machineToken": token, "machineType": mtype, "machineCode": code,
+            "vm": bool(vm_info.get("isVm")),
+            "vm_info": vm_info,
+            "source": MACHINE_IDENTITY_NATIVE}
+
+
+def _identity_vote_key(ident):
+    """表决键：token + 三元组判别字段（type/code/isVm/brand/vmTypeCode）。
+
+    刻意排除 vmInfo.percentage 这类连续噪声字段——它们波动不应破坏多数表决；
+    写盘采用选中样本的**完整** vmInfo（三元组天然自洽、不逐字段杂交）。
+    """
+    vm = ident.get("vm_info") if isinstance(ident.get("vm_info"), dict) else {}
+    try:
+        vm_type_code = int(vm.get("vmTypeCode") or 0)
+    except (TypeError, ValueError):
+        vm_type_code = -1
+    return (ident.get("machineToken"), ident.get("machineType"),
+            ident.get("machineCode"), bool(vm.get("isVm")),
+            str(vm.get("brand") or ""), vm_type_code)
+
+
+def _identity_branch_label(ident):
+    """提取样本的（品牌, vmTypeCode），用于投票日志。"""
+    vm = ident.get("vm_info") if isinstance(ident.get("vm_info"), dict) else {}
+    return str(vm.get("brand") or "unknown"), vm.get("vmTypeCode")
+
+
+def _first_identity_with_vote(realm, account_id, rounds=IDENTITY_VOTE_ROUNDS,
+                              extend_rounds=IDENTITY_VOTE_EXTEND_ROUNDS):
+    """首次落盘前的**自适应**多数表决：先采样 rounds 次；全一致直接采纳，
+    出现分歧则再补 extend_rounds 次（上限有界），取出现次数最多的**完整样本**。
+
+    - 取完整样本 = machineType / machineCode / vmInfo 天然自洽（不逐字段拼）；
+    - 唯一多数 → 采纳；平票 / 全分歧 → 取**首次出现的**样本（确定性），
+      日志明确写出不一致与补投过程；
+    - 全部采样都无输出（组件不可用）时返回 {}，交给既有失败回退路径；
+    - 本函数绝不清种子（那是 force / RESET / TTL 轮换的换身份路径）。
+    """
+    def take(count):
+        got = []
+        for _ in range(max(0, int(count))):
+            sample = _sample_identity(realm, account_id)
+            if sample:
+                got.append(sample)
+        return got
+
+    samples = take(max(1, int(rounds)))
+    if not samples:
+        return {}
+    tally = {}
+    for sample in samples:
+        tally.setdefault(_identity_vote_key(sample), []).append(sample)
+    if len(tally) == 1:
+        # 首轮全一致：直接采纳（证据见常量区注释——最常见情形，成本不增加）
+        picked = samples[0]
+        brand, vm_type_code = _identity_branch_label(picked)
+        _identity_cache_log(
+            "INFO", "identity vote: %d/%d %s (vmTypeCode=%s)"
+            % (len(samples), len(samples), brand, vm_type_code))
+        return picked
+    # 出现分歧：补投（上限 rounds+extend_rounds，保证首次延迟有界）
+    samples.extend(take(extend_rounds))
+    tally = {}
+    for sample in samples:
+        tally.setdefault(_identity_vote_key(sample), []).append(sample)
+    top_key = max(tally, key=lambda key: len(tally[key]))
+    top_count = len(tally[top_key])
+    total = len(samples)
+    unique_top = sum(1 for key in tally if len(tally[key]) == top_count) == 1
+    first_brand, first_vtc = _identity_branch_label(samples[0])
+    if unique_top:
+        picked = tally[top_key][0]
+        brand, vm_type_code = _identity_branch_label(picked)
+        minority_names = "/".join(
+            _identity_branch_label(tally[key][0])[0]
+            for key in tally if key != top_key)
+        summary = ("%d rounds disagreed; extended to %d -> %d/%d %s "
+                   "(%d minority %s; vmTypeCode=%s)"
+                   % (int(rounds), total, top_count, total, brand,
+                      total - top_count, minority_names, vm_type_code))
+    else:
+        picked = samples[0]
+        distribution = " / ".join(
+            "%s %d" % (_identity_branch_label(tally[key][0])[0], len(tally[key]))
+            for key in tally)
+        summary = ("%d rounds disagreed; extended to %d -> no majority (%s); "
+                   "using first sample (%s, vmTypeCode=%s)"
+                   % (int(rounds), total, distribution, first_brand, first_vtc))
+    _identity_cache_log("INFO", "identity vote: " + summary)
+    return picked
+
+
 def native_machine_identity(realm, account_id, force=False):
     """调用官方原生桥取真实机器身份；任何失败返回 {}（调用方回退派生值）。
 
@@ -580,6 +701,11 @@ def native_machine_identity(realm, account_id, force=False):
     _purge_identity_seed）。只有**缓存优先**（落盘命中就不调组件）才能让
     Docker 重建/升级容器后身份不变；组件不可用时回退落盘缓存（哪怕过期），
     不再被迫退化到 derived 假身份。
+
+    另：**首次落盘**前对组件做自适应多数表决（先 IDENTITY_VOTE_ROUNDS 次，
+    分歧时补至 IDENTITY_VOTE_ROUNDS + IDENTITY_VOTE_EXTEND_ROUNDS 次，取出现
+    次数最多的完整样本）——组件的 VM 判定会抖到另一分支（实测 1.56%~10.29%），
+    单次采样会把用户永久固定到少数派（QD_MACHINE_IDENTITY_VOTE=0 可关闭表决）。
     """
     now = time.time()
     cache_on = _identity_cache_enabled()
@@ -616,20 +742,13 @@ def native_machine_identity(realm, account_id, force=False):
     # 缓存的正常获取（那时用户并没有要求换身份）。
     if force or ttl_rotation:
         _purge_identity_seed()
-    # ③ 调组件
-    ident = {}
-    data = run_runtime_info(realm, account_id)
-    if data:
-        token = str(data.get("machineToken") or "").strip()
-        mtype = str(data.get("machineType") or "").strip()
-        code = str(data.get("machineCode") or "").strip()
-        vm_info = data.get("vmInfo") if isinstance(data.get("vmInfo"), dict) else {}
-        if token and mtype and code:
-            ident = {"machineToken": token, "machineType": mtype,
-                     "machineCode": code,
-                     "vm": bool(vm_info.get("isVm")),
-                     "vm_info": vm_info,
-                     "source": MACHINE_IDENTITY_NATIVE}
+    # ③ 调组件（首次落盘时做多数表决：组件的 VM 判定有 1~2% 概率抖到另一
+    #    分支，单次采样会把用户永久固定到少数派。表决只在"首次无可用缓存"
+    #    发生；force 自愈 / TTL 轮换 / 缓存关闭 保持单次调用不变。）
+    if cache_on and not force and not ttl_rotation and _identity_vote_enabled():
+        ident = _first_identity_with_vote(realm, account_id)
+    else:
+        ident = _sample_identity(realm, account_id)
     if ident:
         if cache_on:
             kept = _save_identity_cache(realm, ident, force=force)
