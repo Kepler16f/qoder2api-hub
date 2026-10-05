@@ -832,6 +832,7 @@ def recent_usage(limit=100, realm=None, page=1):
 
 POOL = None
 SCHEDULER = None
+SERVER = None   # ThreadingHTTPServer 实例；main() 运行期间非 None，供内嵌调用方停机
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
 REALM_STATE_FILE = os.path.join(ACCOUNTS_DIR, "active_realm.json")
 
@@ -6376,9 +6377,10 @@ def acc_realm(account):
     return account.realm if account else CURRENT_REALM
 
 
-def main():
+def main(argv=None):
+    # argv=None 时读 sys.argv（命令行用法不变）；桌面壳等内嵌调用方传 list。
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
-        USAGE_SUMMARY, SCHEDULER
+        USAGE_SUMMARY, SCHEDULER, SERVER
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(
         description="Qoder (qoder.com.cn / qoder.com) -> OpenAI-compatible proxy")
@@ -6408,7 +6410,7 @@ def main():
     ap.add_argument("--panel-password", default=None,
                     help="set the web panel password on startup (default: "
                          "admin)")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.lan and args.host == "127.0.0.1":
         args.host = "0.0.0.0"
@@ -6595,10 +6597,12 @@ def main():
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
     try:
+        SERVER = server   # 桌面壳等内嵌调用方经此优雅停机（shutdown() 须跨线程调）
         server.serve_forever()
     except KeyboardInterrupt:
         log("bye")
     finally:
+        SERVER = None
         try:
             server.server_close()
         except Exception:

@@ -1,0 +1,160 @@
+name: Desktop builds
+
+# 桌面客户端多平台构建（5 条产线，覆盖 6 类设备）：
+#   windows-latest   → Windows x64        （Intel/AMD 原生）
+#   windows-11-arm   → Windows ARM64 原生  （WOA；WebView2 宿主为纯 ctypes，原生可用）
+#   macos-14         → macOS Apple Silicon（pywebview/WKWebView 内嵌）
+#   ubuntu-22.04     → Linux x64          （PySide6/QtWebEngine 内嵌，glibc≥2.28）
+#   ubuntu-24.04-arm → Linux ARM64        （QtWebEngine，glibc≥2.39，即新发行版）
+# 说明：Intel 版 macOS 因 GitHub macos-13 runner 退役不再产线化，源码构建见
+# desktop/README.md。GUI 不在 CI 里自动化（无显示服务器），每条产线以
+# --smoke-test 无头冒烟为准；GUI 链路已在 WOA 真机人工验证。
+#
+# 打 v* tag 时自动把 5 个产物发布到 GitHub Release；手动触发仅出 artifacts。
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest,   target: windows-x64,   py: "3.12" }
+          - { os: windows-11-arm,   target: windows-arm64, py: "3.12" }
+          - { os: macos-14,         target: macos-arm64,   py: "3.12" }
+          - { os: ubuntu-22.04,     target: linux-x64,     py: "3.12" }
+          - { os: ubuntu-24.04-arm, target: linux-arm64,   py: "3.12" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.py }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
+
+      - name: Show environment
+        run: |
+          python --version
+          python -c "import platform; print(platform.machine())"
+          python -m pip --version
+
+      # Linux：Qt 运行库（PyInstaller 分析/收集 PySide6 扩展时需要其依赖存在）；
+      # glib 包名 22.04 与 24.04 不同（libglib2.0-0 / t64 后缀），逐个尝试。
+      - name: Install Linux GUI runtime libs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libdbus-1-3 libfontconfig1
+          sudo apt-get install -y --no-install-recommends libglib2.0-0 \
+            || sudo apt-get install -y --no-install-recommends libglib2.0-0t64 \
+            || true
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+          # 每个平台只装它内嵌 UI 需要的依赖（壳代码按平台自适应）：
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            python -m pip install pywebview          # WKWebView 后端（pyobjc 随装）
+          elif [ "${{ runner.os }}" = "Linux" ]; then
+            python -m pip install PySide6            # QtWebEngine 内嵌
+          fi
+          # Windows 不需要任何 GUI 依赖：tkinter 内置 + WebView2 宿主为纯 ctypes
+
+      # UMID 组件（每日 Credits 活动的真身识别）。Windows 产线跳过——官方
+      # 组件在 npm 包里只有 PE x64 且 _install_umid.py 明确不服务 win32；
+      # Windows 用户装着官方 Qoder 客户端时网关会自动发现它（README 有说明）。
+      - name: Extract UMID component (POSIX)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          case "${{ matrix.target }}" in
+            linux-x64)   ARCH=x86_64; PLAT=linux  ;;
+            linux-arm64) ARCH=aarch64; PLAT=linux ;;
+            macos-arm64) ARCH=arm64;   PLAT=darwin ;;
+          esac
+          python _install_umid.py --platform "$PLAT" --arch "$ARCH" --dest umid \
+            || echo "WARN: UMID extraction failed; gateway falls back (chat 不受影响)"
+
+      - name: Build (PyInstaller)
+        run: python -m PyInstaller desktop/qoder2api-hub.spec --noconfirm
+
+      # 无头冒烟：起网关 → /health → /v1/models → / → 优雅停机（GUI 完全不参与）
+      - name: Smoke test
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            BIN="dist/Qoder2API-Hub.app/Contents/MacOS/Qoder2API-Hub"
+          else
+            BIN="dist/Qoder2API-Hub"
+            [ "${{ runner.os }}" = "Windows" ] && BIN="dist/Qoder2API-Hub.exe"
+          fi
+          "$BIN" --smoke-test --port 8799
+          echo "smoke exit=$?"
+
+      - name: Package (macOS ad-hoc sign + zip)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - dist/Qoder2API-Hub.app
+          ditto -c -k --sequesterRsrc --keepParent dist/Qoder2API-Hub.app \
+            Qoder2API-Hub-${{ matrix.target }}.zip
+
+      - name: Stage artifact
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp dist/Qoder2API-Hub.exe "Qoder2API-Hub-${{ matrix.target }}.exe"
+          elif [ "${{ runner.os }}" != "macOS" ]; then
+            cp dist/Qoder2API-Hub "Qoder2API-Hub-${{ matrix.target }}"
+            chmod +x "Qoder2API-Hub-${{ matrix.target }}"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Qoder2API-Hub-${{ matrix.target }}
+          path: |
+            Qoder2API-Hub-${{ matrix.target }}.exe
+            Qoder2API-Hub-${{ matrix.target }}.zip
+            Qoder2API-Hub-${{ matrix.target }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: rel
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -la rel/
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Qoder2API-Hub desktop $GITHUB_REF_NAME" \
+            --notes "桌面客户端多平台产物，见 desktop/README.md 的安装与首次运行说明。
+
+          - Windows x64 / ARM64（原生，双击即用，无需安装 Python）
+          - macOS Apple Silicon（zip 内为 .app，首跑右键打开绕过 Gatekeeper）
+          - Linux x64 / ARM64（单文件，chmod +x 后运行；内嵌 QtWebEngine）" \
+            rel/Qoder2API-Hub-*

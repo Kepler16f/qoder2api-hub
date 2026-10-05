@@ -49,6 +49,16 @@
 
 ## 一、快速启动
 
+### 0. 桌面客户端（开箱即用，推荐）
+
+双击即用的桌面版：**窗口内直接内嵌本看板**（功能与网页版 100% 对等——账号
+管理、OAuth 添加、签到福利、模型清单、用量指标、实时日志都在应用窗口里），
+覆盖 Windows x64 / Windows ARM64（原生）/ macOS Apple Silicon / Linux x64 /
+Linux ARM64，关闭窗口即优雅停机。产物下载、各平台内嵌实现、数据目录与源码
+构建说明见 **[desktop/README.md](desktop/README.md)**；CI 打 `v*` tag 自动
+构建并发布（`.github/workflows/desktop-build.yml`）。以下 1-5 节为脚本/容器
+部署方式。
+
 ### 1. 本机单机使用
 双击运行 **`start-qoder-proxy.bat`**，保持窗口运行：
 - **API 接口地址**：`http://127.0.0.1:8790/v1`
