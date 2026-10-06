@@ -4604,6 +4604,190 @@ check("#52 后端·时区无关：TZ=UTC / America/New_York / Asia/Shanghai 三�
       _tz37)
 
 print()
+print("[38] issue #21：只读积分路由 GET /credits/summary（真实 handler + 命门桩）")
+import http.server as _hs38
+import threading as _th38
+import urllib.error as _ue38
+import urllib.request as _ur38
+
+_FC38 = []                                   # fetch_credits 桩计数（命门）
+_ORIG_FETCH38 = A.Account.fetch_credits
+
+
+def _stub_fetch38(self, *a, **k):
+    _FC38.append(getattr(self, "uid", "?"))
+    return {"remain": 1, "used": 0, "size": 1}
+
+
+A.Account.fetch_credits = _stub_fetch38
+_ORIG_G38 = {_k: getattr(P, _k, None)
+             for _k in ("POOL", "API_KEY", "API_KEY_FILE_SET")}
+
+
+class _Pool38(object):
+    def __init__(self, accounts):
+        self.accounts = accounts
+
+    def representative(self):
+        return self.accounts[0] if self.accounts else None
+
+    def pick(self, *a, **k):
+        return self.representative()
+
+
+def _acc38(uid, realm="cn", remain=100, used=5, size=200, nick=None, credits=True):
+    _a = A.Account({"uid": uid, "realm": realm, "accessToken": "dt-x"})
+    _a.nickname = nick
+    if credits:
+        _a.credits = {"remain": remain, "used": used, "size": size}
+    return _a
+
+
+def _serve38(accounts, api_key="", key_file_set=False):
+    P.POOL = _Pool38(accounts)
+    P.API_KEY = api_key
+    P.API_KEY_FILE_SET = key_file_set
+    _s = _hs38.ThreadingHTTPServer(("127.0.0.1", 0), P.Handler)
+    _th38.Thread(target=_s.serve_forever, daemon=True).start()
+    return _s, _s.server_address[1]
+
+
+def _get38(port, path="/credits/summary", headers=None):
+    _r = _ur38.Request("http://127.0.0.1:%d%s" % (port, path), headers=headers or {})
+    try:
+        with _ur38.urlopen(_r, timeout=12) as _resp:
+            return int(_resp.status), _resp.read().decode("utf-8", "replace")
+    except _ue38.HTTPError as _e:
+        return int(_e.code), _e.read().decode("utf-8", "replace")
+    except Exception as _e:
+        return None, "%s: %s" % (type(_e).__name__, _e)
+
+
+try:
+    _accs38 = [_acc38("u-cn-1", "cn", 100, 5, 200, "一号"),
+               _acc38("u-cn-2", "cn", 300, 10, 400, "二号"),
+               _acc38("u-intl-1", "intl", 50, 1, 100, "三号")]
+    _srv38, _port38 = _serve38(_accs38, api_key="right-key", key_file_set=True)
+    try:
+        _FC38.clear()
+        _st38, _body38 = _get38(_port38, headers={"Authorization": "Bearer right-key"})
+        _j38 = json.loads(_body38) if _body38.strip().startswith("{") else {}
+        check("#58-1 【命门】GET /credits/summary 绝不触发 fetch_credits()（桩计数=0）",
+              _st38 == 200 and len(_FC38) == 0, (_st38, _FC38, _body38[:120]))
+        check("#58-2 结构完整：by_realm / totals / accounts[] / note 齐备，accounts 字段齐全"
+              "（uid/nickname/realm/remain/used/size/registered_at）",
+              all(_k in _j38 for _k in ("by_realm", "totals", "accounts", "note"))
+              and all(all(_f in _a for _f in
+                          ("uid", "nickname", "realm", "credits_remain",
+                           "credits_used", "credits_size", "registered_at"))
+                      for _a in _j38.get("accounts") or []),
+              list(_j38.keys()))
+        _sum_remain = sum(_a.get("credits_remain") or 0
+                          for _a in _j38.get("accounts") or [])
+        _br_remain = sum(_v for _v in (_j38.get("by_realm") or {}).values()
+                         if isinstance(_v, (int, float)))
+        check("#58-3 by_realm（整数求和）与 accounts[]、totals 三者一致 = 450",
+              _sum_remain == 450 and _br_remain == 450
+              and (_j38.get("totals") or {}).get("remain") == 450
+              and (_j38.get("totals") or {}).get("accounts") == 3,
+              (_sum_remain, _br_remain, _j38.get("totals"), _j38.get("by_realm")))
+        check("#58-4 有效 API key → 200", _st38 == 200, _st38)
+        _st38b, _ = _get38(_port38, headers={"Authorization": "Bearer WRONG"})
+        check("#58-5 无效 key + 已设 key → 401", _st38b == 401, _st38b)
+        _st38c, _ = _get38(_port38)
+        check("#58-6 无凭据 + 已设 key → 401", _st38c == 401, _st38c)
+        _tok38 = P.PANEL.create()
+        _st38d, _body38d = _get38(_port38, headers={"X-Panel-Token": _tok38})
+        check("#58-7 面板会话（X-Panel-Token）→ 200（_key_ok 同时解锁管理 API）",
+              _st38d == 200 and len(_FC38) == 0, (_st38d, _body38d[:90]))
+    finally:
+        _srv38.shutdown()
+        _srv38.server_close()
+
+    # ---- 未设 key：应放行 ----
+    _srv38b, _port38b = _serve38(_accs38, api_key="", key_file_set=False)
+    try:
+        _FC38.clear()
+        _st38e, _body38e = _get38(_port38b)
+        check("#58-8 未设 key（auth_required 假）→ 放行 200，且仍不触发 fetch_credits",
+              _st38e == 200 and len(_FC38) == 0, (_st38e, _body38e[:90]))
+    finally:
+        _srv38b.shutdown()
+        _srv38b.server_close()
+
+    # ---- 防御：空池 ----
+    _srv38c, _port38c = _serve38([], api_key="k", key_file_set=True)
+    try:
+        _st38f, _body38f = _get38(_port38c, headers={"Authorization": "Bearer k"})
+        _j38f = json.loads(_body38f) if _body38f.strip().startswith("{") else {}
+        check("#58-9 防御·空池 → 200 且结构合法（aggregate 为 0、accounts 空数组）",
+              _st38f == 200 and _j38f.get("accounts") == []
+              and _j38f.get("by_realm") == {} and (_j38f.get("totals") or {}).get("remain") == 0,
+              (_st38f, _j38f))
+    finally:
+        _srv38c.shutdown()
+        _srv38c.server_close()
+
+    # ---- 防御：账号没有 credits 字段 ----
+    _srv38d, _port38d = _serve38([_acc38("u-nocred", "cn", credits=False),
+                                  _acc38("u-yes", "cn", 70, 1, 80)],
+                                 api_key="k", key_file_set=True)
+    try:
+        _st38g, _body38g = _get38(_port38d, headers={"Authorization": "Bearer k"})
+        _j38g = json.loads(_body38g) if _body38g.strip().startswith("{") else {}
+        _rows38g = _j38g.get("accounts") or []
+        _none_row = next((_r for _r in _rows38g if _r.get("uid") == "u-nocred"), {})
+        check("#58-10 防御·账号无 credits 字段 → 200、该行 remain=None、且不计入求和（70）",
+              _st38g == 200 and _none_row.get("credits_remain") is None
+              and (_j38g.get("totals") or {}).get("remain") == 70,
+              (_st38g, _none_row, _j38g.get("totals")))
+    finally:
+        _srv38d.shutdown()
+        _srv38d.server_close()
+
+    # ---- 能红证据：把实现改成"先 fetch_credits 再返回"→ 命门断言必红 ----
+    _orig_summary38 = P.credits_summary
+
+    def _mut_summary38():
+        for _a in (P.POOL.accounts if P.POOL else []):
+            try:
+                _a.fetch_credits()
+            except Exception:
+                pass
+        return _orig_summary38()
+
+    _srv38e, _port38e = _serve38(_accs38, api_key="k", key_file_set=True)
+    try:
+        _FC38.clear()
+        P.credits_summary = _mut_summary38
+        _st38h, _ = _get38(_port38e, headers={"Authorization": "Bearer k"})
+        _mut_hits38 = len(_FC38)
+    finally:
+        P.credits_summary = _orig_summary38
+        _srv38e.shutdown()
+        _srv38e.server_close()
+    check("#58-11 能红证据：实现若改成「先 fetch_credits 再返回」→ 命门断言必红"
+          "（变异下桩被调 %d 次，> 0）" % _mut_hits38,
+          _st38h == 200 and _mut_hits38 > 0, (_st38h, _mut_hits38))
+
+    # ---- 防御：POOL 为 None ----
+    _orig_pool38 = P.POOL
+    P.POOL = None
+    try:
+        _j38i = P.credits_summary()
+        check("#58-12 防御·POOL 为 None → 不抛异常，返回空结构",
+              _j38i.get("accounts") == [] and _j38i.get("by_realm") == {}
+              and (_j38i.get("totals") or {}).get("remain") == 0, _j38i)
+    except Exception as _e38i:
+        check("#58-12 防御·POOL 为 None → 不抛异常，返回空结构", False, repr(_e38i))
+    finally:
+        P.POOL = _orig_pool38
+finally:
+    A.Account.fetch_credits = _ORIG_FETCH38
+    for _k, _v in _ORIG_G38.items():
+        setattr(P, _k, _v)
+
+print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
       % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
 print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"
