@@ -1,17 +1,26 @@
-# Qoder2API-Hub — 国际版、国内版多账号网关中枢
+# Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.17-2496ED?style=flat-square" alt="Version 1.2.17">
+  <img src="https://img.shields.io/badge/Release-v1.3.0-2496ED?style=flat-square" alt="Version 1.3.0">
+  <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
   <img src="https://img.shields.io/badge/License-MIT-green.svg?style=flat-square" alt="License">
-  <img src="https://img.shields.io/badge/Zero-Dependency-ff69b4?style=flat-square" alt="Zero Dependency">
 </p>
 
-本项目为 **Qoder2API-Hub**，将阿里 **[qoder.com.cn](https://qoder.com.cn)** (国内版) 与 **[qoder.com](https://qoder.com)** (国际版) 的原生服务封装为标准 OpenAI 兼容接口，支持 Chat Completions 与 Responses API。具备多账号负载轮询、稳定物理设备指纹隔离、OAuth 设备授权一键免客户端登录、每日签到与实时额度查询、Pro 福利包自动领取、后台常驻定时调度器、Web 监控看板等全套能力 —— 与 WorkBuddy2API-Hub 同构的完整功能矩阵。
+**Qoder2API-Hub Desktop** 是 [shuishuipingan/qoder2api-hub](https://github.com/shuishuipingan/qoder2api-hub)（v1.2.17）的**桌面发行版**：把「Qoder 国际版/国内版多账号 OpenAI 兼容网关 + Web 监控看板」打包为开箱即用的跨平台桌面应用 —— 双击安装，**窗口内直接内嵌完整看板**，不依赖外部浏览器，也不需要命令行。网关协议层（COSY 签名、设备指纹、签到福利、双区路由）与上游保持一致，零协议改动。
 
-- **开箱即用**：双击批处理脚本即启；亦支持 Docker 容器化部署，零外部 pip 依赖。
+**桌面客户端（本仓库核心增量）**
+
+- **内嵌看板**：账号管理、OAuth 一键授权、签到与福利中心、模型清单、用量指标、实时日志全部在窗口内完成，功能与网页版 100% 对等
+- **平台覆盖**：Windows x64 / Windows ARM64（**原生**，非仿真）/ macOS Apple Silicon / Linux x64 / Linux ARM64；内嵌不可用时自动回退控制台 + 浏览器
+- **系统集成**：系统托盘（应用图标）、关窗/最小化收进托盘、开机自启、窗口尺寸记忆、深色模式跟随系统（标题栏 + 看板）
+- **看板内设置**：托盘与开机自启开关在看板「设置」页的「桌面客户端」区块内直接切换，无需另开窗口
+- **安装即用**：Inno Setup 按用户安装（无需管理员，不动开始菜单）/ macOS DMG / Linux deb；CI 打 `v*` tag 自动构建发布五产线安装包
+
+**网关能力（承继上游）**
+
 - **本机已登录凭证一键入池（双区）**：只读探测桌面 App（`auth.v1.dat`，os_crypt/DPAPI 解密）与 Qoder CLI（`~/.qoder*/.auth/user`，AES-128-CBC）两类官方存储，看板两步确认导入，永不静默采用。
 - **模型清单完全跟官方走（双区不同、以官方此刻为准）**：三源优先级 —— 动态 `/algo/api/v2/model/list`（COSY 签名，**GET 需携带与签名一致的 `{}` body，否则 403**）> 本机官方客户端模型目录缓存（`~/.qoder*/.models/<uid>/catalog-v6`，QMC/HKDF+AES-256-GCM 解密）> 双区官方快照文件（`qoder_catalog_intl.json`/`qoder_catalog_cn.json`，`python _refresh_catalog.py` 一键随客户端更新）；清单**以动态源返回的集合为准**（官方桌面版此刻显示什么这里就显示什么，如国际版动态 15 条就不多塞静态独有的 `smodel/cmodel`）。**逐字段忠实保留**：`id` = **官方模型名**（如 `Qwen3.8-Max`，客户端唯一需要填的值；`upstream_key`/`aliases` 同时给出 key、`key (Name)` 与人类别名等全部可填形式）、官方桌面版介绍文案（`description`，取自客户端 dynamic-text）、本地化名（`name_local`，如 Ultimate→极致）、`context_config` 多窗口（200K 默认/400K/1M）、`thinking_config` 思考档位（low/medium/high/xhigh/max + 默认标注 + 可关闭）、**峰谷价**（`price_factor_peak` 促销前倍率 → `price_factor_valley` 谷时倍率 + `off_peak` 时段窗口 22:00-08:00 与官方错峰文案）、`is_free/is_new`；官方 `enable=false` 条目不过滤，附**官方原文禁用原因**（`disabled_reason = "需要升级或购买千问官方套餐开放"`，并透传上游 `disabled_message_key`）。**最大输出**：官方 catalog 与动态接口原始响应均无此字段，故不再输出/展示任何编造值。
 - **双区域独立路由**：支持 🌐 国际版 (qoder.com / api1.qoder.sh，备用 api2/api3 自动故障切换) 与 🇨🇳 国内版 (qoder.com.cn / gateway.qoder.com.cn) 独立配置与管理，区域独占模型（如国内 `q37fmodel`/`glm-5.2`、国际 `smodel`/`ultimate`）自动路由到归属出口并拦截错配 Key，看板一键切换且状态落盘持久化。
@@ -23,7 +32,7 @@
 - **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`；若回声被**截断**无法还原，则按严格判据吞掉、绝不把内部标记透给用户，而普通回复一律 fail-open 不吞正文）。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
 
-> ⚡ 本项目架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系。
+> ⚡ 网关架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系；上游更新可在本仓库 rebase 携带。
 
 ---
 
@@ -53,12 +62,25 @@
 
 双击即用的桌面版：**窗口内直接内嵌本看板**（功能与网页版 100% 对等——账号
 管理、OAuth 添加、签到福利、模型清单、用量指标、实时日志都在应用窗口里），
-覆盖 Windows x64 / Windows ARM64（原生）/ macOS Apple Silicon / Linux x64 /
-Linux ARM64。支持深色模式跟随系统、最小化收缩系统托盘、开机自启、窗口尺寸
-记忆；关闭窗口即优雅停机。安装包下载、各平台内嵌实现、数据目录与源码构建
-说明见 **[desktop/README.md](desktop/README.md)**；CI 打 `v*` tag 自动构建
-并发布（`.github/workflows/desktop-build.yml`）。以下 1-5 节为脚本/容器
-部署方式。
+支持深色模式跟随系统、最小化收缩系统托盘、开机自启、窗口尺寸记忆；关闭
+窗口即优雅停机。到 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases)
+下载对应平台安装包（CI 打 `v*` tag 自动构建发布）：
+
+| 文件 | 适用 |
+|---|---|
+| `Qoder2API-Hub-setup-windows-x64.exe` | Windows 10/11 x64（按用户安装，无需管理员） |
+| `Qoder2API-Hub-setup-windows-arm64.exe` | Windows on ARM（原生运行，非仿真） |
+| `Qoder2API-Hub-macos-arm64.dmg` | Apple Silicon Mac（拖进 Applications） |
+| `qoder2api-hub-linux-x64.deb` | 主流发行版 x64（`sudo dpkg -i`） |
+| `qoder2api-hub-linux-arm64.deb` | ARM64 Linux（Ubuntu 24.04+ 等） |
+
+- 首次打开看板的面板密码是 `admin`，请立即在「设置」页修改；
+- 托盘与开机自启开关在看板「设置」页的**「桌面客户端」区块**内（仅内嵌壳
+  中显示），真正退出走托盘菜单的「退出」；
+- 各平台内嵌实现（Windows 为自研 ctypes WebView2 宿主，win-arm64 原生）、
+  数据目录、源码运行与本地构建说明见 **[desktop/README.md](desktop/README.md)**。
+
+以下 1-5 节为脚本 / 容器部署方式（与桌面版共用同一套网关与看板）。
 
 ### 1. 本机单机使用
 双击运行 **`start-qoder-proxy.bat`**，保持窗口运行：
@@ -437,7 +459,47 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 ## 七、版本与更新日志 (Changelog)
 
-完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+完整说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases)
+（本仓库）；上游历史版本见
+[shuishuipingan/qoder2api-hub/releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.0 — 开箱即用桌面客户端
+
+**✨ 新增功能：跨平台桌面客户端（Windows / macOS / Linux × x64 / ARM64）**
+
+- **内嵌看板**：窗口内直接内嵌 Web 看板，功能与网页版 100% 对等；各平台
+  自适应内嵌 —— Windows 用**自研纯标准库 ctypes WebView2 宿主**
+  （clr_loader/pythonnet 与 QtWebEngine 均无 win-arm64 支持，故手写 COM，
+  **Windows ARM64 原生运行、不走仿真**），macOS 用 pywebview（WKWebView），
+  Linux 用 PySide6 + QtWebEngine，内嵌不可用自动回退控制台 + 浏览器；
+- **系统集成**：系统托盘（`desktop/trayicon.py` 纯 ctypes
+  Shell_NotifyIcon，图标用 `CreateIconFromResourceEx` 解析内置应用 .ico）、
+  关窗/最小化收进托盘、真正退出在托盘菜单；开机自启三平台（HKCU Run /
+  LaunchAgent / XDG autostart，无需管理员，`--hidden` 静默进托盘）；
+  窗口尺寸记忆（`desktop.json`）；深色模式跟随系统（DWM 深色标题栏 +
+  看板 `prefers-color-scheme` 变量覆盖）；
+- **看板内嵌设置**：托盘与开机自启开关在看板「设置」页「桌面客户端」区块
+  内切换（仅内嵌壳显示），页面 → 主进程经 `chrome.webview.postMessage`
+  回传；
+- **安装包**：Inno Setup 按用户安装（`%LOCALAPPDATA%\Programs`，无需管理
+  员，不建开始菜单文件夹，简体中文）、macOS DMG（ad-hoc 签名）、Linux deb；
+  CI 五产线（windows-latest / windows-11-arm / macos-14 / ubuntu-22.04 /
+  ubuntu-24.04-arm）打 `v*` tag 自动构建发布。
+
+**🐛 问题修复**
+
+- **修复进程无痕消失（"网关崩溃"）**：WebView2 `WebMessageReceived` 的
+  COM 回调栈上调用 tkinter（包括 `root.after`）会破坏当前线程的 Python
+  线程状态，触发 `Fatal PyEval_RestoreThread: thread state is NULL`。现
+  回调内仅入队（`queue.Queue`），由 tk 主循环轮询消费；
+- **修复托盘线程启动即崩**：`GetModuleHandleW` 未声明 restype，64 位句柄
+  截断后传入 `CreateWindowExW` 触发 `OverflowError`（冻结环境句柄高位随机
+  命中）；全部 Win32 API 显式 argtypes；
+- **修复托盘图标显示为 Python 默认图标**：不再从 `sys.executable` 提取
+  （源码运行拿到的是 python.exe 图标）；
+- 兼容 Python 3.13+ 移除的 `ctypes.wintypes.GUID / WNDCLASSW`；
+- 网关侧仅加可编程入口（`qoder_proxy.main(argv)`、`SERVER` 全局供优雅停
+  机），协议逻辑零改动。
 
 ### v1.2.17
 

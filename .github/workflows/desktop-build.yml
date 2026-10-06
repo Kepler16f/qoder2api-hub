@@ -209,6 +209,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout (release notes file)
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -220,12 +223,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           ls -la rel/
-          gh release create "$GITHUB_REF_NAME" \
-            --title "Qoder2API-Hub desktop $GITHUB_REF_NAME" \
-            --notes "桌面客户端多平台安装包，安装与首次运行说明见 desktop/README.md。
+          # 发布说明优先取仓库内 release-notes/<tag>.md；缺失时用内置兜底文案
+          NOTES="release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$NOTES" ]; then
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Qoder2API-Hub Desktop $GITHUB_REF_NAME" \
+              --notes-file "$NOTES" \
+              rel/*
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "Qoder2API-Hub Desktop $GITHUB_REF_NAME" \
+              --notes "桌面客户端多平台安装包，安装与首次运行说明见 desktop/README.md。
 
           - Windows x64 / ARM64：Inno Setup 安装包，按用户安装（无需管理员），
             双击即用；可选桌面快捷方式
           - macOS Apple Silicon：DMG，拖进 Applications；首跑右键打开绕过 Gatekeeper
           - Linux x64 / ARM64：deb 包（sudo dpkg -i），装完在应用列表启动" \
-            rel/*
+              rel/*
+          fi
