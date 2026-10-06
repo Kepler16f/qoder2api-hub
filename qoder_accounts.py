@@ -1043,6 +1043,8 @@ class Account(object):
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
+        # 运行时标记（不落盘）：本账号刚消耗过额度，网关应按需尽快回读 quota。
+        self.credits_dirty = False
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
@@ -1907,6 +1909,7 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        self.credits_dirty = False
         if self.path and os.path.exists(os.path.dirname(self.path)):
             self.save(os.path.dirname(self.path))
         return {"ok": True, "credits": self.credits}

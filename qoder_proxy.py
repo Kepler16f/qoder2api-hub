@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 from pathlib import Path
 
-VERSION = "1.2.18"
+VERSION = "1.2.19"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -394,6 +394,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         row["account"] = account
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
+    if acc:
+        # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
+        acc.credits_dirty = True
     if gen_ms and gen_ms > 0:
         row["tokens_per_sec"] = round(
             fields["completion_tokens"] / (gen_ms / 1000.0), 2)
@@ -899,6 +902,72 @@ def usage_by_account(ttl=10):
         _byacct_cache["at"] = time.time()
         _byacct_cache["data"] = data
     return data
+
+
+# ---------------------------------------------------------------------------
+# 额度（credits）按需刷新：/accounts 是看板每 15s 的轮询口，读数时若发现某
+# 账号额度过期，就在后台单飞补一次（不阻塞响应，下一次轮询即可见新值）。
+# 聊天消耗后该账号被标记 credits_dirty，约 5 秒后即可触发回读；失败不会
+# 跟随轮询频率放大请求（同一账号的尝试间隔受 TTL 兜底）。
+# ---------------------------------------------------------------------------
+CREDITS_TTL = float(os.environ.get("QD_CREDITS_TTL") or 60)
+CREDITS_DIRTY_GAP = 5.0            # 用后加速：距上次尝试的最小间隔（秒）
+_credits_kick_lock = threading.Lock()
+_credits_running = False
+_credits_last_try = {}             # uid -> 上次尝试时间戳
+
+
+def _credits_due(account, now):
+    """该账号的额度是否需要回读（够期、从未取过、或刚消耗过）。"""
+    cred = getattr(account, "credits", None) or {}
+    try:
+        last_ok = float(cred.get("updated_at") or 0)
+    except Exception:
+        last_ok = 0.0
+    last_try = max(last_ok, _credits_last_try.get(account.uid, 0.0))
+    if getattr(account, "credits_dirty", False):
+        return (now - last_try) > CREDITS_DIRTY_GAP
+    if not cred:
+        return True
+    if getattr(account, "enabled", True) is False:
+        return (now - last_try) > CREDITS_TTL * 5    # 停用账号低频补一次
+    return (now - last_try) > CREDITS_TTL
+
+
+def kick_credits_refresh(realm=None):
+    """后台单飞刷新过期账号的额度；立即返回，不阻塞调用方。"""
+    global _credits_running
+    if not POOL:
+        return False
+    now = time.time()
+    with _credits_kick_lock:
+        if _credits_running:
+            return False
+        targets = [a for a in list(POOL.accounts)
+                   if (not realm or realm == "all" or a.realm == realm)
+                   and _credits_due(a, now)]
+        if not targets:
+            return False
+        _credits_running = True
+        for a in targets:
+            _credits_last_try[a.uid] = now
+
+    def _run():
+        global _credits_running
+        try:
+            for a in targets:
+                try:
+                    a.fetch_credits()
+                except Exception as exc:
+                    log("credits refresh failed on %s: %s"
+                        % (a.uid[:8], str(exc)[:120]), level="WARN",
+                        tag="credits")
+        finally:
+            with _credits_kick_lock:
+                _credits_running = False
+
+    threading.Thread(target=_run, name="credits-refresh", daemon=True).start()
+    return True
 
 
 def _usage_by_account_uncached():
@@ -5331,6 +5400,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/accounts":
             if not self._authorized():
                 return
+            # 看板 15s 轮询口：顺带把过期额度在后台补上，下一次轮询即见新值
+            kick_credits_refresh(realm=query.get("realm", [None])[0]
+                                 or CURRENT_REALM)
             return self._json(200, {
                 "accounts": account_views(realm=query.get("realm", [None])[0]
                                           or CURRENT_REALM),
