@@ -52,7 +52,10 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 from pathlib import Path
 
-VERSION = "1.2.20"
+# 网关版本自 2026-10 起改用日期命名（YYYY.MM.DD），与上游的 1.2.x semver 号线
+# 天然不撞（历史 fork 曾占用 1.2.18/1.2.19/1.2.20，与上游 1.2.18 撞车后才改制）。
+# 桌面发行线是另一套号(v1.3.x tag)，「检查更新」按它对比本仓库 Releases。
+VERSION = "2026.10.07"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -887,8 +890,54 @@ def account_views(realm=None):
     return POOL.list_public(realm=realm)
 
 
+_CREDITS_SUMMARY_NOTE = ("registered values only; freshness depends on "
+                         "check-in and consumption write-back")
+
 _byacct_cache = {"at": 0.0, "data": None}
 _byacct_lock = threading.Lock()
+
+
+def credits_summary():
+    """issue #21：只读积分汇总（**绝不触发上游查询**）。
+
+    数据源是 accounts/*.json 里**已登记**的 credits（fetch_credits 写入 +
+    每次消耗回写）；同宿主机轮询方（API Pool 面板）用它替代裸读目录文件。
+    与 /accounts/credits 的区别：那个会逐号强刷上游，只适合手动点击 ——
+    本函数一次网络调用都不发。
+
+    防御：POOL 为 None / 列表为空 / 账号没有 credits（新号还没登过）/
+    credits 结构残缺 —— 都只影响该行取值（None）与它是否计入汇总，
+    绝不抛异常、绝不 500。
+    """
+    by_realm = {}
+    rows = []
+    total_remain = 0
+    accounts = list(POOL.accounts) if POOL else []
+    for a in accounts:
+        cred = getattr(a, "credits", None)
+        if not isinstance(cred, dict):
+            cred = {}
+        realm = getattr(a, "realm", "") or ""
+        remain = cred.get("remain")
+        rows.append({
+            "uid": getattr(a, "uid", "") or "",
+            "nickname": getattr(a, "nickname", "") or "",
+            "realm": realm,
+            "credits_remain": remain,
+            "credits_used": cred.get("used"),
+            "credits_size": cred.get("size"),
+            # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
+            "registered_at": cred.get("updated_at"),
+        })
+        if isinstance(remain, (int, float)) and not isinstance(remain, bool):
+            by_realm[realm] = by_realm.get(realm, 0) + int(remain)
+            total_remain += int(remain)
+    return {
+        "by_realm": by_realm,
+        "totals": {"remain": total_remain, "accounts": len(rows)},
+        "accounts": rows,
+        "note": _CREDITS_SUMMARY_NOTE,
+    }
 
 
 def usage_by_account(ttl=10):
@@ -5401,6 +5450,13 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
             return self._json(200, recent_usage(limit, realm=req_realm, page=page))
+        if path == "/credits/summary":
+            # issue #21：只读积分汇总。**刻意不放进 _is_panel_route** ——
+            # 同宿主机轮询方用 API key 即可拉取；实现内绝不触发上游查询
+            # （对照 /accounts/credits 的逐号强刷，那个适合手动点击）。
+            if not self._authorized():
+                return
+            return self._json(200, credits_summary())
         if path == "/accounts/credits":
             if not self._authorized():
                 return
