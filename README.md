@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.0-2496ED?style=flat-square" alt="Version 1.3.0">
+  <img src="https://img.shields.io/badge/Release-v1.3.2-2496ED?style=flat-square" alt="Version 1.3.2">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -462,6 +462,21 @@ python _verify_models.py --base http://127.0.0.1:8790
 完整说明见 [Releases](https://github.com/Kepler16f/qoder2api-hub-desktop/releases)
 （本仓库）；上游历史版本见
 [shuishuipingan/qoder2api-hub/releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.2 — 传输韧性与额度实时化
+
+- **上游传输韧性**（网关 1.2.18）：出站 opener 改为**逐请求实时解析代理状态**，
+  彻底修掉"进程启动瞬间的系统代理被缓存到进程结束 → 代理软件退出/换端口后
+  所有上游调用撞死在死端口（`WinError 10061`）、用户侧任何开关操作都无效、
+  只能重启应用"的顽固故障（TUN / 系统代理 / 直连随时切换，`QD_PROXY_UPSTREAM_PROXY`
+  可显式钉死代理出口）；全账号传输层故障时改为退避 15 秒**整池重扫**（最多
+  2 轮），扛过上游 ~1 分钟级拒连/断流风暴再判失败，而不是 ~30 秒就回 502
+  （401/429/其他 4xx 语义不变）。
+- **额度（credits）实时化**（网关 1.2.19）：看板 15 秒轮询的 `/accounts`
+  现在会按 TTL（默认 60 秒，`QD_CREDITS_TTL` 可调）在后台**单飞刷新**过期
+  额度，不再依赖手动点「刷新积分」；每次对话消耗后该账号被标记，约 5 秒后
+  即可回读——实测对话结束后 **5 秒**余额自动更新（400 → 389），看板不再
+  显示几小时前的旧值。
 
 ### v1.3.0 — 开箱即用桌面客户端
 
