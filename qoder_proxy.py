@@ -49,10 +49,10 @@ import qoder_settings
 import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
-                            local_vm_status)
+                            local_vm_status, UPSTREAM_OPENER)
 from pathlib import Path
 
-VERSION = "1.2.17"
+VERSION = "1.2.18"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1426,7 +1426,7 @@ def read_dynamic_models(realm=None):
             url = validate_public_http_url(raw_url)
             req = urllib.request.Request(url, data=sign_body.encode("utf-8"),
                                          method="GET", headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with UPSTREAM_OPENER.open(req, timeout=15) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             break
         except Exception as exc:
@@ -3250,6 +3250,10 @@ def extract_session_key(headers, payload):
 # 上游瞬时故障（与客户端参数无关，值得同账号快速重试）
 TRANSIENT_HTTP_CODES = (418, 500, 502, 503, 504)
 TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退避）
+# 全池传输层故障（上游拒连风暴可长达 1 分钟以上，同账号 3 连试 +
+# 逐号轮换约 30s 就耗尽）：整池退避后重扫，把上游抖动挡在代理内侧。
+UPSTREAM_MAX_SWEEPS = 2            # 全池失败后的整池重扫轮数上限
+UPSTREAM_SWEEP_WAIT = 15           # 每轮重扫前的退避秒数
 CHECKIN_MIN_GAP = 1.0              # 签到防风控：账号之间的最小间隔（秒）
 _CLIENT_FAULT_MARKERS = (
     "invalid_parameter_error",     # 如 Range of max_tokens 校验失败
@@ -3482,7 +3486,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 pass
 
 
-def open_upstream(payload, session_key=None, target_realm=None):
+def open_upstream(payload, session_key=None, target_realm=None, _sweeps=0):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
     账号轮换规则：
@@ -3491,7 +3495,9 @@ def open_upstream(payload, session_key=None, target_realm=None):
       - 418/5xx/provider_error（瞬时上游故障）-> 同账号快速重试 2 次
                 （1s/2s 退避），仍失败短冷却(15s/单账号3s)换号
       - 其他 4xx（含客户端参数错）-> 快速失败，冷却换号，不重试
-    全部账号失败后抛 RateLimited 或最后一个错误。
+    全部账号因传输层故障（拒连/断流风暴）失败时，整池退避重扫
+    （_sweeps 保护下最多 UPSTREAM_MAX_SWEEPS 轮）；仍失败才抛
+    RateLimited 或最后一个错误。
     """
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     model = str(payload.get("model") or "")
@@ -3561,7 +3567,7 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 req = urllib.request.Request(chat_url,
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
-                resp = urllib.request.urlopen(req, timeout=600)
+                resp = UPSTREAM_OPENER.open(req, timeout=600)
                 break
             except urllib.error.HTTPError as exc:
                 try:
@@ -3689,6 +3695,28 @@ def open_upstream(payload, session_key=None, target_realm=None):
                                        single_account=(total <= 1))
                 last_error = exc
             continue
+
+    # 全部账号传输层故障（上游拒连/断流风暴可持续 1 分钟以上，而同账号
+    # 3 连试 + 逐号轮换约 30s 就耗尽）：退避后整池重扫，把上游的瞬时抖动
+    # 挡在代理内侧，而不是变成对客户端的 502。扫动期间一旦出现 HTTP 状态
+    # 或频控，说明上游已恢复，立即按既有语义上抛。
+    while (last_error is not None and _sweeps < UPSTREAM_MAX_SWEEPS
+           and not isinstance(last_error, (urllib.error.HTTPError, RateLimited))
+           and _is_transient_transport(last_error)):
+        _sweeps += 1
+        log("all %d account(s) transport-failing on '%s' (last: %s) - "
+            "cooling %.0fs then full-pool sweep %d/%d"
+            % (len(tried), model, str(last_error)[:80], UPSTREAM_SWEEP_WAIT,
+               _sweeps, UPSTREAM_MAX_SWEEPS),
+            level="WARN", tag="chat")
+        time.sleep(UPSTREAM_SWEEP_WAIT)
+        try:
+            return open_upstream(payload, session_key=session_key,
+                                 target_realm=realm, _sweeps=_sweeps)
+        except RateLimited:
+            raise
+        except Exception as sweep_exc:
+            last_error = sweep_exc
 
     if last_error is not None:
         if last_429 is not None:

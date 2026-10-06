@@ -32,6 +32,40 @@ from qoder_fingerprint import (derive_id, generate_request_id,
                                derive_machine_token, derive_machine_type,
                                vm_status)
 
+
+# ---------------------------------------------------------------------------
+# 上游出站 opener：每次请求前实时读取代理状态，不缓存快照。
+#
+# urllib 的默认 opener 在进程内首次 urlopen 时构建一次并缓存到进程结束，
+# 会把启动那一刻的系统代理设置（如 Clash 的 127.0.0.1:7890）永久带进
+# 后续所有请求——代理软件随后退出/换端口时，上游调用会一直撞死在死端口
+# 上（WinError 10061），改注册表、开关系统代理都无法恢复，只能重启进程。
+# 这里改为逐请求刷新，三种出站形态可随时切换、无需重启：
+#   - TUN 模式（FlClash 等）：系统代理开不开都行，流量在网络层被透明接管
+#   - 系统代理（无 TUN）：开关状态对下一个请求立即生效
+#   - 完全直连
+# 环境变量 QD_PROXY_UPSTREAM_PROXY 显式指定时优先生效（如 http://127.0.0.1:7890）。
+# ---------------------------------------------------------------------------
+class UpstreamOpener(object):
+
+    @staticmethod
+    def _handlers():
+        url = (os.environ.get("QD_PROXY_UPSTREAM_PROXY") or "").strip()
+        if url:
+            if "://" not in url:
+                url = "http://" + url
+            return [urllib.request.ProxyHandler({"http": url, "https": url})]
+        return [urllib.request.ProxyHandler(urllib.request.getproxies())]
+
+    def open(self, req, timeout=None):
+        opener = urllib.request.build_opener(*self._handlers())
+        if timeout is None:
+            return opener.open(req)
+        return opener.open(req, timeout=timeout)
+
+
+UPSTREAM_OPENER = UpstreamOpener()
+
 # ---------------------------------------------------------------------------
 # 区域常量（逆向自官方桌面/CLI 客户端）
 # ---------------------------------------------------------------------------
@@ -969,7 +1003,7 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
             headers=headers or {},
         )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with UPSTREAM_OPENER.open(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as exc:
             last = exc
@@ -2305,7 +2339,7 @@ class AccountPool(object):
             "User-Agent": "QoderWork",
         })
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with UPSTREAM_OPENER.open(req, timeout=20) as resp:
                 raw = resp.read().decode("utf-8")
                 status = resp.status
         except urllib.error.HTTPError as exc:
@@ -2341,7 +2375,7 @@ class AccountPool(object):
                 "User-Agent": CLIENT_UA,
                 "Authorization": "Bearer " + token,
             })
-            with urllib.request.urlopen(req_ui, timeout=15) as resp_ui:
+            with UPSTREAM_OPENER.open(req_ui, timeout=15) as resp_ui:
                 ui = json.loads(resp_ui.read().decode("utf-8"))
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
