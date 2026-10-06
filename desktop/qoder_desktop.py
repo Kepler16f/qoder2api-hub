@@ -33,6 +33,7 @@ import functools
 import json
 import os
 import queue
+import socket
 import sys
 import threading
 import time
@@ -42,6 +43,9 @@ import webbrowser
 
 APP_NAME = "Qoder2API-Hub"
 APP_TITLE = "Qoder2API-Hub"
+# 桌面发行版版本：跟 GitHub release tag 走（发新版时同步 bump 这里）。
+# 检查更新用它对比最新 tag；网关本体的 VERSION 是另一条版本线（与上游对齐）。
+APP_VERSION = "1.3.2"
 DEFAULT_PORT = 8790
 LOG_NAME = "desktop-gateway.log"
 CONFIG_NAME = "desktop.json"
@@ -560,6 +564,20 @@ def wait_healthy(port, timeout=25.0):
     return False
 
 
+def _wait_port_free(port, timeout=10.0):
+    """等端口不再有人应答（重启客户端时，旧进程释放端口可能要 1-2 秒）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", int(port)),
+                                          timeout=0.5):
+                pass                      # 还能连上 = 旧网关还占着
+        except OSError:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def open_browser(port):
     def _open():
         try:
@@ -679,6 +697,10 @@ class ShellState(object):
 
         def worker():
             gw.stop(timeout=6.0)      # 重启路径下先确保旧实例完全停掉（幂等）
+            if (os.environ.get("QD_DESKTOP_RESTART") or "").strip() == "1":
+                # 从"重启客户端"拉起的新进程：旧进程可能还差半拍没退干净，
+                # 端口没释放就绑定会直接失败（没有第二次机会），等它就绪。
+                _wait_port_free(port, timeout=10.0)
             gw.start("127.0.0.1", port, lan)
             ok = wait_healthy(port, timeout=30.0)
             note = None if ok else (gw.exit_note or "网关未能在 30 秒内就绪")
@@ -764,6 +786,22 @@ def _print_window_shot(tk_root, png_path):
         rows.append(line)
     with open(png_path, "wb") as fh:
         fh.write(encode_png(rows, w, h))
+
+
+# 托盘右键菜单（原生 Win32 菜单在托盘线程弹出，命令 id 回传后由壳分派）
+TRAY_CMD_SHOW = 1
+TRAY_CMD_DASHBOARD = 2
+TRAY_CMD_SETTINGS = 3
+TRAY_CMD_RESTART = 4
+TRAY_CMD_EXIT = 5
+TRAY_MENU = (
+    (TRAY_CMD_SHOW, "显示主窗口"),
+    (TRAY_CMD_DASHBOARD, "打开看板"),
+    (TRAY_CMD_SETTINGS, "设置…"),
+    None,                              # 分隔线
+    (TRAY_CMD_RESTART, "重启"),
+    (TRAY_CMD_EXIT, "退出"),
+)
 
 
 def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
@@ -948,6 +986,13 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
             # start() 是异步的，此刻 webview 指针才真正可用。
             # 滚动条隐藏/深色注入等一律在导航完成后走 execute_script，
             # 绝不在回调里直接调 AddScript（会崩，见 webview2_host 注释）。
+            # 返回手势防护（见 webview2_host.harden_navigation）：必须在任何
+            # 页面导航之前做——此刻尚无待决的异步事件，Settings 同步调用不会
+            # 与 WebMessage 等回调投递竞态（实测在导航后再调会随机崩）。
+            try:
+                host.harden_navigation()
+            except Exception as exc:
+                print("[desktop] harden_navigation failed: %r" % exc)
             host.navigate_to_string(BOOT_HTML)
             try:
                 host.on_web_message(on_web_message)
@@ -1095,11 +1140,18 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
             else:
                 root.withdraw()
                 print("[desktop] tray-left -> hidden to tray")
-        elif name == "tray-right" and tray:
-            try:
-                tray_menu.tk_popup(payload[0], payload[1])
-            finally:
-                tray_menu.grab_release()
+        elif name == "tray-cmd":
+            # 原生托盘菜单选中项（菜单在托盘线程弹出，这里只做分派）
+            if payload == TRAY_CMD_SHOW:
+                show_main()
+            elif payload == TRAY_CMD_DASHBOARD:
+                open_browser(port_var.get())
+            elif payload == TRAY_CMD_SETTINGS:
+                open_settings()
+            elif payload == TRAY_CMD_RESTART:
+                restart_client()
+            elif payload == TRAY_CMD_EXIT:
+                real_exit()
         elif name == "closing":
             root.destroy()
 
@@ -1152,7 +1204,8 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
     def ensure_tray():
         nonlocal tray
         if tray is None and sys.platform == "win32" and trayicon:
-            tray = trayicon.TrayIcon(state.events)
+            trayicon.enable_dark_menus()   # 原生菜单跟随系统深色主题
+            tray = trayicon.TrayIcon(state.events, menu=TRAY_MENU)
             tray.start()
 
     def remove_tray():
@@ -1169,17 +1222,7 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
         except Exception:
             pass
 
-    tray_menu = tk.Menu(root, tearoff=0)
-    if dark:
-        tray_menu.configure(bg="#1f2937", fg="#e5e7eb",
-                            activebackground="#374151",
-                            activeforeground="#f9fafb")
-    tray_menu.add_command(label="显示主窗口", command=show_main)
-    tray_menu.add_command(label="打开看板",
-                          command=lambda: open_browser(port_var.get()))
-    tray_menu.add_command(label="设置…", command=open_settings)
-    tray_menu.add_separator()
-    tray_menu.add_command(label="退出", command=lambda: real_exit())
+    # 托盘菜单已改为原生 Win32 菜单（trayicon 在托盘线程弹出，见 TRAY_MENU）
 
     # 托盘：默认开启；--hidden（开机自启）强制开启并直接藏进托盘
     if cfg.get("tray", True) or hidden:
@@ -1192,6 +1235,62 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
             ("__EVENT__", "tray-left", None)))
         root.after(9500, lambda: state.events.put(
             ("__EVENT__", "tray-left", None)))
+
+    def restart_client():
+        """托盘菜单「重启」：重启整个客户端（不是只重启网关）。
+
+        先停后拉：网关端口必须由旧进程释放，新实例才能绑定；子进程带
+        QD_DESKTOP_RESTART=1，起网关前会再等端口真正空闲（防旧进程退出
+        慢半拍）。9 秒兜底强杀，绝不留悬挂进程。
+        """
+        if state.stopping:
+            return
+        try:
+            if root.state() == "normal":
+                cfg["win_w"] = root.winfo_width()
+                cfg["win_h"] = root.winfo_height()
+                save_config(config_path, cfg)
+        except Exception:
+            pass
+        remove_tray()
+        state.stopping = True
+        set_status("正在重启客户端…", color=AMBER)
+        root.after(9000, lambda: os._exit(0))
+
+        def worker():
+            state.gw.stop(timeout=6.0)
+            try:
+                import subprocess
+                argv = [sys.executable]
+                if not is_frozen():
+                    argv.append(os.path.abspath(sys.argv[0]))
+                argv += list(sys.argv[1:])
+                env = dict(os.environ)
+                # onefile：bootloader 用 _MEIPASS2/_PYI_ 前缀环境变量把"应用
+                # 阶段"进程指向父进程已解包的 _MEI 临时目录。重启拉起的是全新
+                # 顶层进程，必须剥离这些标记——否则它会复用父进程的 _MEI 目录，
+                # 父进程退出即删除之，子进程 import select.pyd 当场失败
+                # （实测 ModuleNotFoundError: select）。
+                for k in list(env):
+                    if k.startswith("_MEIPASS") or k.startswith("_PYI_"):
+                        env.pop(k, None)
+                env["QD_DESKTOP_RESTART"] = "1"
+                env.pop("QD_RESTART_TEST", None)   # 子进程不再自动重启（防循环）
+                env.pop("QD_TRAY_TEST", None)
+                subprocess.Popen(argv, env=env, close_fds=True)
+                print("[desktop] restart -> spawned %r" % (argv,))
+            except Exception as exc:
+                print("[desktop] restart spawn failed: %r" % exc)
+            state.events.put(("__EVENT__", "closing", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    if (os.environ.get("QD_RESTART_TEST") or "").strip() == "1":
+        # 诊断：启动稳定后触发一次 restart_client，验证"重启客户端"链路。
+        # 配合 --smoke-gui --auto-close-ms：旧进程 spawn 新进程后即退出，
+        # 新进程（QD_RESTART_TEST 已从环境剥离）正常起网关、auto-close 真退出。
+        # 新进程若成功绑定端口并健康，说明端口交接与重启闭环都成立。
+        root.after(8000, restart_client)
 
     def real_exit():
         # 托盘菜单「退出」/ 关窗即退模式下的唯一真退出路径：
@@ -1839,6 +1938,8 @@ def main(argv=None):
         return 0
     if opts["data_dir"]:
         os.environ["QD_DATA_DIR"] = opts["data_dir"]
+    # 桌面发行版版本交给网关：「检查更新」按它对比本仓库的 release tag
+    os.environ.setdefault("QD_APP_VERSION", APP_VERSION)
     if opts["mode"] == "smoke":
         return smoke_test(pick_free_port(opts["port"]))
     if opts["mode"] == "smoke-gui":

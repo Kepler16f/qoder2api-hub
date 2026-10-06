@@ -8,7 +8,14 @@
 
 事件：
     ("__EVENT__", "tray-left",  None)      左键（UI 侧自行决定显示/隐藏）
-    ("__EVENT__", "tray-right", (x, y))    右键（坐标已取好，UI 弹菜单用）
+    ("__EVENT__", "tray-cmd",   cmd_id)    右键菜单选中项（菜单在托盘线程
+                                           原生弹出，选中的命令 id 回传 UI）
+
+右键菜单为原生 Win32 弹出菜单（TrackPopupMenu）：菜单生命周期、点击外部
+消失都由系统负责。历史坑：早前用 tk 的 tk_popup 弹菜单，点击别处经常不
+消失、残留在桌面上（Tk 弹出菜单在 Windows 上的已知缺陷），故改为原生。
+必配的两步（MSDN KB135788）：弹出前 SetForegroundWindow(hwnd)，返回后
+PostMessage(hwnd, WM_NULL)——缺任何一个菜单都会"点了别处也不消失"。
 
 线程安全：wndproc 回调运行在托盘线程，只做 put 队列（put 线程安全），
 绝不直接触碰 tk。
@@ -22,11 +29,40 @@ from ctypes import wintypes
 WM_APP_TRAY = 0x8000 + 0x51          # WM_APP 区间自定义托盘回调消息
 WM_QUIT = 0x0012
 WM_DESTROY = 0x0002
+WM_NULL = 0x0000
 NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONUP = 0x0205
 WM_USER_TASKBAR_CREATED = None       # RegisterWindowMessage 结果，运行期填充
+
+# 弹出菜单（全部按 64 位句柄/UINT_PTR 显式声明 argtypes，见 _run 里的教训）
+MF_STRING = 0x0000
+MF_SEPARATOR = 0x0800
+TPM_RIGHTBUTTON = 0x0002
+TPM_RETURNCMD = 0x0100               # 直接返回选中项 id（不走 WM_COMMAND）
+
+
+def enable_dark_menus():
+    """让进程内的 Win32 经典菜单/弹窗跟随系统深色主题（未文档化导出）。
+
+    SetPreferredAppMode(AllowDark=1) 在 uxtheme 序号 135，FlushMenuThemes
+    在 136（Win10 1903+ 起）。老系统没有该导出，静默返回 False——不影响
+    功能，只是菜单保持系统默认配色。
+    """
+    try:
+        ux = ctypes.WinDLL("uxtheme")
+        set_mode = ux[135]
+        set_mode.restype = c_int
+        set_mode.argtypes = [c_int]
+        set_mode(1)                  # AllowDark：跟随系统主题
+        flush = ux[136]
+        flush.restype = None
+        flush.argtypes = []
+        flush()
+        return True
+    except Exception:
+        return False
 
 
 class _GUID(ctypes.Structure):
@@ -72,11 +108,16 @@ class NOTIFYICONDATAW(ctypes.Structure):
 
 
 class TrayIcon(object):
-    """系统托盘图标。start() 后台线程建窗+挂图标；stop() 删图标并收线程。"""
+    """系统托盘图标。start() 后台线程建窗+挂图标；stop() 删图标并收线程。
 
-    def __init__(self, sink, tip="Qoder2API-Hub"):
+    menu: 右键菜单项序列，元素为 (cmd_id, label) 或 None（分隔线）。
+          在托盘线程里原生弹出，选中项经 sink 投递 ("tray-cmd", cmd_id)。
+    """
+
+    def __init__(self, sink, tip="Qoder2API-Hub", menu=None):
         self.sink = sink
         self.tip = tip
+        self.menu = tuple(menu or ())
         self._thread = None
         self._tid = 0
         self._hwnd = None
@@ -149,14 +190,43 @@ class TrayIcon(object):
         except Exception:
             return None
 
+    def _show_menu(self):
+        """在托盘线程原生弹出右键菜单（TrackPopupMenu）。
+
+        只在托盘线程调用：菜单属于创建它的线程，跨线程 Track 会拿不到
+        输入、点了别处也不消失。"""
+        u32 = ctypes.windll.user32
+        hmenu = u32.CreatePopupMenu()
+        if not hmenu:
+            return
+        cmd = 0
+        try:
+            for item in self.menu:
+                if item is None:
+                    u32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
+                else:
+                    cmd_id, label = item
+                    u32.AppendMenuW(hmenu, MF_STRING, int(cmd_id), label)
+            pt = wintypes.POINT()
+            u32.GetCursorPos(byref(pt))
+            # 必须先抢前台（KB135788）：否则菜单不会随"点击别处"消失
+            u32.SetForegroundWindow(self._hwnd)
+            cmd = u32.TrackPopupMenu(
+                hmenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                pt.x, pt.y, 0, self._hwnd, None)
+            # 把前台还回去，菜单的鼠标捕获才算彻底释放（否则仍可能残留）
+            u32.PostMessageW(self._hwnd, WM_NULL, 0, 0)
+        finally:
+            u32.DestroyMenu(hmenu)
+        if cmd:
+            self.sink.put(("__EVENT__", "tray-cmd", int(cmd)))
+
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == WM_APP_TRAY:
             if lparam == WM_LBUTTONUP:
                 self.sink.put(("__EVENT__", "tray-left", None))
             elif lparam == WM_RBUTTONUP:
-                pt = wintypes.POINT()
-                ctypes.windll.user32.GetCursorPos(byref(pt))
-                self.sink.put(("__EVENT__", "tray-right", (pt.x, pt.y)))
+                self._show_menu()
             return 0
         if msg == WM_DESTROY:
             ctypes.windll.user32.PostQuitMessage(0)
@@ -210,6 +280,19 @@ class TrayIcon(object):
         u32.PostQuitMessage.argtypes = [ctypes.c_int]
         u32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
                                            wintypes.WPARAM, wintypes.LPARAM]
+        # 右键菜单 API：句柄/ID 都是 64 位，缺 argtypes 会被截断成 32 位
+        u32.CreatePopupMenu.restype = wintypes.HMENU
+        u32.AppendMenuW.restype = wintypes.BOOL
+        u32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                    ctypes.c_size_t, wintypes.LPCWSTR]
+        u32.TrackPopupMenu.restype = c_uint32
+        u32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT,
+                                       c_int, c_int, c_int, wintypes.HWND,
+                                       c_void_p]
+        u32.DestroyMenu.argtypes = [wintypes.HMENU]
+        u32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                     wintypes.WPARAM, wintypes.LPARAM]
         # GetModuleHandleW 缺 restype 时返回被截断的 int（低 32 位为负则变
         # 巨大无符号数），塞进 CreateWindowExW 的 hInstance 就 OverflowError
         # ——这正是"托盘线程一启动就崩"的根因（冻结环境 handle 高位随机命中）。

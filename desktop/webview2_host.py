@@ -142,6 +142,7 @@ class WebView2Host(object):
         self._webview = None        # ICoreWebView2*
         self._keep = []             # COM 回调与其 vtable 的引用，防 GC
         self._lock = threading.Lock()
+        self._nav_guard_ok = False  # harden_navigation 是否成功（诊断/测试用）
 
     # -- 回调（都在 UI 线程经消息泵触发） ------------------------------------
     def _on_env(self, this, hr, env):
@@ -174,6 +175,10 @@ class WebView2Host(object):
         wv = c_void_p()
         com_call(self._controller, 25, HRESULT, [POINTER(c_void_p)], byref(wv))
         self._webview = wv.value                   # getter 已含 +1 引用
+        # ⚠️ harden_navigation() 含跨进程 COM 调用，绝不能在 ControllerCompleted
+        # 回调栈上执行（会泵消息、破坏本线程 Python 状态 → Fatal
+        # PyEval_RestoreThread，进程无痕消失）。由调用方在 UI 事件循环里调，
+        # 见 run_windows_shell 的 root.after 与 _test_nav_guard.py。
         if self._on_created:
             try:
                 self._on_created()
@@ -305,6 +310,53 @@ class WebView2Host(object):
     def navigate_to_string(self, html):
         if self._webview:
             com_call(self._webview, 6, HRESULT, [c_wchar_p], c_wchar_p(html))
+
+    def harden_navigation(self):
+        """屏蔽返回手势与浏览器快捷键（无回调注册，纯 Settings 写）。
+
+        背景：壳先用 NavigateToString 显示网关开启动画，就绪后导航到看板；
+        触控板横扫/鼠标侧键（或 Alt+←）会把 WebView 回退到启动动画——那里
+        只有"等网关"逻辑，不会自动前进，界面就此卡死，用户无法回到主界面。
+
+        做法（ICoreWebView2Settings）：
+          - put_IsSwipeNavigationEnabled(FALSE)（槽 32）：关闭触控板横扫
+            前进/后退与鼠标侧键导航；
+          - put_AreBrowserAcceleratorKeysEnabled(FALSE)（槽 24）：关闭 F5/
+            Ctrl+P/Alt+←→ 等浏览器快捷键（看板有自身刷新，影响可接受）。
+
+        ⚠️ 历史教训（勿走回头路）：曾尝试 add_NavigationStarting 拦截回退
+        导航——WebView2 在**关闭/拆卸阶段**仍会投递事件，Python 回调在解释
+        器 finalizing 时被调用 → Fatal PyEval_RestoreThread 随机崩溃（实测
+        即使回调体为空也必崩）。事件注册类防护在此壳里一律禁用。
+
+        返回两个设置是否都成功。"""
+        if not self._webview:
+            return False
+        ok = []
+        settings = c_void_p()
+        try:
+            # get_Settings 在 ICoreWebView2（槽 3）上——controller 槽 3 是
+            # get_IsVisible，打错对象会把 BOOL 当指针用（真机访问违例）。
+            hr = com_call(self._webview, 3, HRESULT,
+                          [POINTER(c_void_p)], byref(settings))
+            ok.append(hr == S_OK and bool(settings))
+            if settings:
+                hr_sw = com_call(settings, 32, HRESULT, [c_int], 0)   # swipe
+                hr_key = com_call(settings, 24, HRESULT, [c_int], 0)  # accel keys
+                ok.append(hr_sw == S_OK)
+                ok.append(hr_key == S_OK)
+                if hr_sw != S_OK or hr_key != S_OK:
+                    print("[webview2] settings hr swipe=0x%08X accel=0x%08X"
+                          % (hr_sw & 0xFFFFFFFF, hr_key & 0xFFFFFFFF))
+        except Exception as exc:
+            print("[webview2] harden_navigation failed: %r" % exc)
+        finally:
+            if settings:
+                com_call(settings, 2, c_uint32, [])     # Release
+        self._nav_guard_ok = bool(ok) and all(ok)
+        if not self._nav_guard_ok:
+            print("[webview2] WARN: navigation hardening incomplete: %r" % ok)
+        return self._nav_guard_ok
 
     def get_source(self):
         """ICoreWebView2::get_Source（slot 4）—— 当前 URL/诊断用。"""

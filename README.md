@@ -463,7 +463,7 @@ python _verify_models.py --base http://127.0.0.1:8790
 （本仓库）；上游历史版本见
 [shuishuipingan/qoder2api-hub/releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
-### v1.3.2 — 传输韧性与额度实时化
+### v1.3.2 — 传输韧性、额度实时化与桌面体验修复
 
 - **上游传输韧性**（网关 1.2.18）：出站 opener 改为**逐请求实时解析代理状态**，
   彻底修掉"进程启动瞬间的系统代理被缓存到进程结束 → 代理软件退出/换端口后
@@ -477,6 +477,17 @@ python _verify_models.py --base http://127.0.0.1:8790
   额度，不再依赖手动点「刷新积分」；每次对话消耗后该账号被标记，约 5 秒后
   即可回读——实测对话结束后 **5 秒**余额自动更新（400 → 389），看板不再
   显示几小时前的旧值。
+- **桌面壳修复**（网关 1.2.20）：①屏蔽返回手势——触控板横扫/鼠标侧键/Alt+←
+  退回"网关开启动画"后卡死的问题，改为 WebView 就绪时写入
+  `IsSwipeNavigationEnabled=FALSE` + `AreBrowserAcceleratorKeysEnabled=FALSE`
+  （纯 Settings 写、零事件回调，规避拆卸阶段 `PyEval_RestoreThread` 必崩）；
+  ②托盘菜单新增**「重启」**——先停后拉、端口交接等待、onefile 子进程剥离
+  `_MEIPASS2` 标记（否则子进程 `ModuleNotFoundError: select` 起不来）；
+  ③托盘右键菜单改原生 Win32 菜单（KB135788 标准方案），修复点击后残留桌面
+  不消失；④检查更新指向本仓库 Releases，版本对比改用桌面发行版版本号。
+- **Linux 包体积优化**：按 ELF 依赖闭包裁剪未用的 Qt 模块/qml/locale/翻译
+  （归档 232.8 → 174.9MB，-25%）+ strip；**本期暂缓发布 Linux 包**，优化后的
+  包将在独立版本中发布。
 
 ### v1.3.0 — 开箱即用桌面客户端
 

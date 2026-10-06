@@ -73,6 +73,15 @@ a = Analysis(
     noarchive=False,
 )
 
+# Linux：PySide6 hook 会把整棵 Qt 树塞进包（deb 因此 ~230MB）。按实际 ELF
+# 依赖闭包裁剪未用模块（3D/图表/多媒体/qml/多余 locale 与翻译）。
+# 实测归档体积 -25%，且 WebEngine 渲染链（Core/Process/ICU/locale）无损。
+strip_linux = sys.platform.startswith("linux")
+if strip_linux:
+    sys.path.insert(0, HERE)
+    import prune_linux
+    a.binaries = prune_linux.prune_binaries(a.binaries, log=print)
+
 pyz = PYZ(a.pure)
 
 if onefile:
@@ -86,6 +95,7 @@ if onefile:
         console=False,          # 无控制台窗口；输出经桌面壳 Tee 进日志面板/文件
         icon=icon,
         upx=False,
+        strip=strip_linux,      # 剥离 .so/.dist 符号表（Linux 专属收益）
     )
 else:
     exe = EXE(

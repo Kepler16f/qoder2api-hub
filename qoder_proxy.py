@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 from pathlib import Path
 
-VERSION = "1.2.19"
+VERSION = "1.2.20"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -2056,10 +2056,19 @@ def normalize_reasoning_effort(effort, meta):
 # ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
 # ---------------------------------------------------------------------------
-UPDATE_CHECK_URL = ("https://api.github.com/repos/shuishuipingan/"
-                    "qoder2api-hub/releases/latest")
+UPDATE_CHECK_URL = ("https://api.github.com/repos/Kepler16f/"
+                    "qoder2api-hub-desktop/releases/latest")
 UPDATE_CHECK_TTL = 6 * 3600
 _update_cache = {"at": 0.0, "data": None}
+
+
+def app_version():
+    """检查更新用的"当前版本"。
+
+    桌面壳注入 QD_APP_VERSION（=发行版 tag，如 1.3.2）；纯网关跑法没有它，
+    退回网关自身 VERSION。两条版本线不要混：release tag 属发行版。
+    """
+    return (os.environ.get("QD_APP_VERSION") or "").strip() or VERSION
 
 
 def version_tuple(value):
@@ -2088,7 +2097,8 @@ def check_for_update(force=False):
     cached = _update_cache.get("data")
     if cached and not force and now - _update_cache.get("at", 0) < UPDATE_CHECK_TTL:
         return cached
-    info = {"ok": False, "current": VERSION, "latest": "", "has_update": False,
+    current = app_version()
+    info = {"ok": False, "current": current, "latest": "", "has_update": False,
             "url": "", "published_at": "", "name": "", "checked_at": int(now),
             "error": ""}
     try:
@@ -2106,7 +2116,7 @@ def check_for_update(force=False):
             "url": str(data.get("html_url") or ""),
             "published_at": str(data.get("published_at") or ""),
             "name": str(data.get("name") or ""),
-            "has_update": bool(tag) and version_tuple(tag) > version_tuple(VERSION),
+            "has_update": bool(tag) and version_tuple(tag) > version_tuple(current),
         })
     except Exception as exc:
         info["error"] = str(exc)[:160]
