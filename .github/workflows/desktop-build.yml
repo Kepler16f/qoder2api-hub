@@ -140,6 +140,9 @@ jobs:
           & $iscc "-DAppVersion=${{ steps.ver.outputs.version }}" `
                   "-DArchTag=$arch" desktop/installer/qoder2api-hub.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          # .iss 固定输出到 installer-out/，复制到根目录供 upload-artifact 收集
+          Copy-Item "installer-out\Qoder2API-Hub-setup-windows-*.exe" . -Force
+          Get-Item "Qoder2API-Hub-setup-windows-*.exe" | Select-Object Name, Length
 
       - name: Package macOS DMG
         if: runner.os == 'macOS'
