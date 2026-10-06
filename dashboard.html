@@ -188,6 +188,9 @@ a:hover{text-decoration:underline}
 .range-btn:hover{color:var(--fg)}
 .range-btn.active{background:var(--accent);color:#fff;font-weight:600;box-shadow:var(--shadow-sm)}
 #analyticsKpiCards .card{padding:12px 16px;min-width:0;overflow:hidden;border-radius:12px;background:#fff;border:1px solid var(--line);box-shadow:var(--shadow)}
+.desk-row{display:flex;align-items:center;gap:10px;padding:9px 0;font-size:14px;color:var(--fg);cursor:pointer}
+.desk-row input{width:16px;height:16px;accent-color:var(--accent);cursor:pointer}
+.desk-note{font-size:12px;color:var(--dim);margin:0 0 6px 26px}
 #analyticsKpiCards .card .v{font-size:19px;font-weight:700;white-space:nowrap}
 #analyticsKpiCards .card .k{font-size:11px;white-space:nowrap;margin-bottom:3px;font-weight:600;color:var(--dim)}
 #analyticsKpiCards .card .s{font-size:10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px;color:var(--dim)}
@@ -209,6 +212,38 @@ a:hover{text-decoration:underline}
 .log-tag.tag-system{background:rgba(100,116,139,.18);color:#94a3b8}
 .log-msg{color:#cbd5e1;flex:1;word-break:break-all;white-space:pre-wrap}
 .log-empty{padding:48px 24px;text-align:center;color:#64748b;font-size:13px;font-family:inherit}
+
+/* ---- 深色模式：跟随系统 prefers-color-scheme，全站变量整体换肤 ---- */
+@media (prefers-color-scheme: dark){
+  :root{
+    --bg:#0b1220; --panel:#121a2b; --panel2:#0e1626; --panel3:#1b2438;
+    --line:#22304d; --line-hover:#31426b;
+    --fg:#e7eef8; --dim:#93a4bd; --dim-light:#6d7f9a;
+    --accent:#4c8dff; --accent-hover:#6ea4ff; --accent-soft:rgba(76,141,255,.16);
+    --accent2:#2dd47f; --accent2-soft:rgba(45,212,127,.16);
+    --warn:#f0a63c; --warn-soft:rgba(240,166,60,.16);
+    --think:#b39cff; --think-soft:rgba(179,156,255,.16);
+    --bad:#ff7b7b; --bad-soft:rgba(255,123,123,.14);
+    --shadow-sm:0 1px 2px 0 rgba(0,0,0,.5);
+    --shadow:0 1px 3px 0 rgba(0,0,0,.5),0 1px 2px -1px rgba(0,0,0,.45);
+    --shadow-md:0 4px 6px -2px rgba(0,0,0,.5),0 2px 4px -2px rgba(0,0,0,.45);
+    color-scheme:dark;
+  }
+  header{background:rgba(11,18,32,.92)}
+  /* 以下元素在浅色主题里用了硬编码白底，深色下逐一对齐变量 */
+  .badge.off{color:#93a4bd;background:#1b2438;border-color:#31426b}
+  button.sec{background:#1b2438}
+  .modal{background:var(--panel)}
+  .login-link:hover{background:#1b2438}
+  .key-card{background:var(--panel)}
+  .key-action-btn{background:#1b2438}
+  .realm-card.active{background:var(--panel)}
+  .toggle-realm-btn{background:#1b2438}
+  .main-nav-btn:hover{background:#1b2438}
+  .main-nav-btn.active{background:var(--panel2)}
+  #analyticsKpiCards .card{background:var(--panel)}
+  ::-webkit-scrollbar{width:0;height:0}
+}
 </style>
 </head>
 <body>
@@ -577,6 +612,23 @@ a:hover{text-decoration:underline}
         <button onclick="addApiKeyRow()">+ 添加 API Key</button>
       </div>
       <div id="keyList"></div>
+    </section>
+
+    <section id="desktopSection" style="display:none">
+      <h2>桌面客户端</h2>
+      <div style="font-size:12px;color:var(--dim);margin-bottom:12px">
+        托盘与开机自启由桌面客户端主进程执行，修改后立即生效（仅桌面客户端内可见）。
+      </div>
+      <label class="desk-row">
+        <input type="checkbox" id="deskTray">
+        <span>关闭 / 最小化时收缩到系统托盘</span>
+      </label>
+      <div class="desk-note">开启后关窗不退出；真正退出请用托盘右键菜单的「退出」。</div>
+      <label class="desk-row" id="deskAutostartRow">
+        <input type="checkbox" id="deskAutostart">
+        <span>开机自动启动（静默进入托盘）</span>
+      </label>
+      <div class="desk-note" id="deskAutostartNote"></div>
     </section>
 
     <section>
@@ -2764,6 +2816,7 @@ async function loadSettings(showToast){
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
     if(showToast) toast('设置已刷新', 'ok');
+    if(desktopCRT) initDesktopSection();
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
   }
@@ -2821,7 +2874,7 @@ function renderKeyRows(){
       const options = REALM_CHOICES.map(([val, lbl]) =>
         '<option value="' + val + '"' + ((row.realm || '') === val ? ' selected' : '') + '>' + lbl + '</option>'
       ).join('');
-      return '<div class="key-card" style="border-color:var(--accent);background:#ffffff;box-shadow:0 0 0 1px var(--accent), var(--shadow-md)">'
+      return '<div class="key-card" style="border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 1px var(--accent), var(--shadow-md)">'
         + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
         +   '<div style="font-size:14px;font-weight:700;color:var(--fg)">' + (row.id ? '编辑 API Key' : '新建 API Key') + '</div>'
         +   '<span class="badge s mini">设置出口</span>'
@@ -3060,6 +3113,48 @@ async function saveApiKeys(btn){
   }
 }
 
+// ---- 桌面客户端联动（内嵌 WebView 壳专用；浏览器里 desktopCRT 恒为 null）----
+// 壳注入的桌面桥：window.__qdDesktop（协议 {v, tray, autostart, autostart_supported}）
+// 开关变更经 chrome.webview.postMessage 回传，由壳真正执行（写注册表/摘挂托盘）。
+function desktopCRT(){
+  try { return (window.__qdDesktop && window.__qdDesktop.v === 1); } catch(e) { return false; }
+}
+function desktopSend(msg){
+  try { window.chrome.webview.postMessage(msg); return true; } catch(e) { return false; }
+}
+function initDesktopSection(){
+  const sec = document.getElementById('desktopSection');
+  if(!sec) return;
+  sec.style.display = '';
+  const tray = document.getElementById('deskTray');
+  const auto = document.getElementById('deskAutostart');
+  const autoRow = document.getElementById('deskAutostartRow');
+  const autoNote = document.getElementById('deskAutostartNote');
+  const d = window.__qdDesktop || {};
+  if(tray) tray.checked = d.tray !== false;
+  if(auto) auto.checked = !!d.autostart;
+  if(autoRow && !d.autostart_supported){
+    autoRow.style.display = 'none';
+    if(autoNote) autoNote.textContent = '开机自启仅安装版可用（当前为源码运行）。';
+  } else if(autoRow){
+    autoRow.style.display = '';
+    if(autoNote) autoNote.textContent = '写入当前用户的自启动项，无需管理员权限。';
+  }
+}
+document.addEventListener('DOMContentLoaded', function(){
+  const tray = document.getElementById('deskTray');
+  const auto = document.getElementById('deskAutostart');
+  if(tray) tray.addEventListener('change', () => desktopToggle('tray', tray.checked));
+  if(auto) auto.addEventListener('change', () => desktopToggle('autostart', auto.checked));
+});
+function desktopToggle(kind, on){
+  const ok = desktopSend({qd: 'set', key: kind, value: !!on});
+  if(!ok){ toast('桌面桥不可用，设置未生效', 'bad'); return; }
+  if(window.__qdDesktop) window.__qdDesktop[kind] = !!on;
+  toast(kind === 'tray'
+    ? (on ? '已开启：关窗/最小化后收缩到托盘' : '已关闭：关窗即退出')
+    : (on ? '已开启开机自启' : '已关闭开机自启'), 'ok');
+}
 function switchMainTab(tab){
   currentMainTab = tab;
   const btnGateway = document.getElementById('btnNavGateway');

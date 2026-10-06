@@ -23,20 +23,37 @@
 
 | 文件 | 适用 |
 |---|---|
-| `Qoder2API-Hub-windows-x64.exe` | Windows 10/11 x64 |
-| `Qoder2API-Hub-windows-arm64.exe` | Windows on ARM（Surface Pro X / Snapdragon 笔记本等，原生） |
-| `Qoder2API-Hub-macos-arm64.zip` | Apple Silicon Mac（M1/M2/M3/M4） |
-| `Qoder2API-Hub-linux-x64` | 主流发行版 x64（glibc ≥ 2.28） |
-| `Qoder2API-Hub-linux-arm64` | ARM64 Linux（glibc ≥ 2.39，如 Ubuntu 24.04+） |
+| `Qoder2API-Hub-setup-windows-x64.exe` | Windows 10/11 x64（安装包，按用户安装） |
+| `Qoder2API-Hub-setup-windows-arm64.exe` | Windows on ARM（Surface Pro X / Snapdragon 笔记本等，原生，安装包） |
+| `Qoder2API-Hub-macos-arm64.dmg` | Apple Silicon Mac（M1/M2/M3/M4，拖进 Applications） |
+| `qoder2api-hub-linux-x64.deb` | 主流发行版 x64（glibc ≥ 2.28，`sudo dpkg -i` 安装） |
+| `qoder2api-hub-linux-arm64.deb` | ARM64 Linux（glibc ≥ 2.39，如 Ubuntu 24.04+） |
 
-- **Windows**：双击 exe 即可。首次运行 SmartScreen 可能提示「已保护你的电脑」
-  ——点「更多信息 → 仍要运行」（未购买代码签名证书的通病）。
-- **macOS**：解压 zip 得到 `Qoder2API-Hub.app`，拖进「应用程序」；首次右键
+- **Windows**：双击安装包，按用户安装（无需管理员，默认装到
+  `%LOCALAPPDATA%\Programs\Qoder2API-Hub`，可选桌面快捷方式）。首次运行
+  SmartScreen 可能提示「已保护你的电脑」——点「更多信息 → 仍要运行」（未购买
+  代码签名证书的通病）。静默部署：`...setup.exe /VERYSILENT /LANG=chinese`。
+- **macOS**：打开 DMG，把 `Qoder2API-Hub.app` 拖进「Applications」；首次右键
   →「打开」（ad-hoc 签名无开发者账号，Gatekeeper 会拦直接双击）。若仍被拦：
   `xattr -cr /Applications/Qoder2API-Hub.app`。
-- **Linux**：`chmod +x Qoder2API-Hub-linux-x64 && ./Qoder2API-Hub-linux-x64`。
-  需要系统有基础 GUI 库（桌面发行版默认齐全）。
+- **Linux**：`sudo dpkg -i qoder2api-hub-linux-x64.deb`，装完在应用列表启动
+  （或执行 `/opt/qoder2api-hub/Qoder2API-Hub`）。需要系统有基础 GUI 库
+  （桌面发行版默认齐全）。
 - 首次进入看板的面板密码是 `admin`，请立即在「设置」里修改（与 API Key 相互独立）。
+
+## 窗口与托盘行为（Windows 壳）
+
+- **窗口记忆**：关闭时自动记住窗口大小，下次按上次尺寸启动（钳制在屏幕范围内）。
+- **系统托盘**：默认开启。关闭/最小化窗口时收缩到托盘（任务栏不占位），托盘
+  图标为应用图标；左键 = 显示/收起主窗口，右键 = 托盘菜单（显示主窗口 /
+  打开看板 / 设置… / 退出）。**真正退出请用托盘菜单的「退出」**。
+- **开机自启**：设置里勾选后写入当前用户的自启动项（注册表 HKCU Run /
+  macOS LaunchAgent / Linux XDG autostart，无需管理员），开机静默进入托盘。
+- **设置位置**：托盘开关与开机自启开关都在**看板「设置」页**里的「桌面客户端」
+  区块内（只有内嵌壳里才显示；用浏览器打开看板看不到这两项）。窗口内右键菜单
+  另有 修改端口 / 局域网 / 复制接口地址 / 复制 API Key / 数据目录。
+- **深色模式**：标题栏与看板自动跟随系统深浅色，无需手动切换。
+- 源码运行模式：托盘与开机自启不可用（UI 会提示）；窗口记忆正常。
 
 ## 数据目录（账号凭证 / 用量 / 日志，均为明文 token，注意保管）
 

@@ -54,9 +54,10 @@
 双击即用的桌面版：**窗口内直接内嵌本看板**（功能与网页版 100% 对等——账号
 管理、OAuth 添加、签到福利、模型清单、用量指标、实时日志都在应用窗口里），
 覆盖 Windows x64 / Windows ARM64（原生）/ macOS Apple Silicon / Linux x64 /
-Linux ARM64，关闭窗口即优雅停机。产物下载、各平台内嵌实现、数据目录与源码
-构建说明见 **[desktop/README.md](desktop/README.md)**；CI 打 `v*` tag 自动
-构建并发布（`.github/workflows/desktop-build.yml`）。以下 1-5 节为脚本/容器
+Linux ARM64。支持深色模式跟随系统、最小化收缩系统托盘、开机自启、窗口尺寸
+记忆；关闭窗口即优雅停机。安装包下载、各平台内嵌实现、数据目录与源码构建
+说明见 **[desktop/README.md](desktop/README.md)**；CI 打 `v*` tag 自动构建
+并发布（`.github/workflows/desktop-build.yml`）。以下 1-5 节为脚本/容器
 部署方式。
 
 ### 1. 本机单机使用

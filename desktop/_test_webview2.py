@@ -16,6 +16,12 @@ import tkinter as tk
 
 from webview2_host import WebView2Host
 
+HIDE_JS = ("(function(){function add(){if(document.getElementById('__qd_nosb'))"
+           "return;var s=document.createElement('style');s.id='__qd_nosb';"
+           "s.textContent='::-webkit-scrollbar{width:0;height:0}';"
+           "(document.documentElement||document.body||document).appendChild(s);}"
+           "add();document.addEventListener('DOMContentLoaded',add);})()")
+
 TEST_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <style>
   body{margin:0;height:100vh;display:flex;flex-direction:column;justify-content:center;
@@ -50,10 +56,17 @@ def main():
               % bool(host._webview))
         stages["ctrl"] = bool(host._webview)     # 严格：拿到 ICoreWebView2 才算过
         if host._webview:
-            host.navigate_to_string(TEST_HTML)
-            stages["nav"] = True
+            # 注意：不能在 ControllerCompleted 回调内重入调用 AddScript 等
+            # 跨进程方法（实测 access violation），必须回到事件循环再调。
+            root.after(0, deferred_setup)
         status.config(text="WebView2 ready & navigated (env+controller OK)")
         root.update_idletasks()
+
+    def deferred_setup():
+        _hr = host.add_init_script(HIDE_JS)
+        print("[deferred] add_init_script -> hr=0x%08X" % (_hr & 0xFFFFFFFF))
+        host.navigate_to_string(TEST_HTML)
+        stages["nav"] = True
 
     def probe():
         print("[probe] source=%r visible=%s" % (host.get_source(),

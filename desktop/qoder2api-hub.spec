@@ -26,6 +26,7 @@ datas = [
     (os.path.join(ROOT, "qoder_catalog_intl.json"), "."),
     (os.path.join(ROOT, "qoder_catalog_cn.json"), "."),
     (os.path.join(HERE, "assets", "qoder2api.png"), "."),
+    (os.path.join(HERE, "assets", "qoder2api.ico"), "."),
 ]
 
 # Windows：WebView2 加载器（arm64 + x64 都带上，运行时按进程架构选）。

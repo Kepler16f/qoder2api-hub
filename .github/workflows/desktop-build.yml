@@ -1,16 +1,17 @@
 name: Desktop builds
 
-# 桌面客户端多平台构建（5 条产线，覆盖 6 类设备）：
-#   windows-latest   → Windows x64        （Intel/AMD 原生）
-#   windows-11-arm   → Windows ARM64 原生  （WOA；WebView2 宿主为纯 ctypes，原生可用）
-#   macos-14         → macOS Apple Silicon（pywebview/WKWebView 内嵌）
-#   ubuntu-22.04     → Linux x64          （PySide6/QtWebEngine 内嵌，glibc≥2.28）
-#   ubuntu-24.04-arm → Linux ARM64        （QtWebEngine，glibc≥2.39，即新发行版）
-# 说明：Intel 版 macOS 因 GitHub macos-13 runner 退役不再产线化，源码构建见
-# desktop/README.md。GUI 不在 CI 里自动化（无显示服务器），每条产线以
-# --smoke-test 无头冒烟为准；GUI 链路已在 WOA 真机人工验证。
+# 桌面客户端多平台构建（5 条产线，覆盖 6 类设备），产物为安装包：
+#   windows-latest   → Qoder2API-Hub-setup-windows-x64.exe   （Inno Setup，按用户安装）
+#   windows-11-arm   → Qoder2API-Hub-setup-windows-arm64.exe （原生 WOA，Inno 6.7 的
+#                                                       安装器本体为 x86，WOA 仿真可跑）
+#   macos-14         → Qoder2API-Hub-macos-arm64.dmg         （ad-hoc 签名 + DMG）
+#   ubuntu-22.04     → qoder2api-hub-linux-x64.deb           （QtWebEngine 内嵌）
+#   ubuntu-24.04-arm → qoder2api-hub-linux-arm64.deb         （glibc≥2.39）
 #
-# 打 v* tag 时自动把 5 个产物发布到 GitHub Release；手动触发仅出 artifacts。
+# GUI 不在 CI 里自动化（无显示服务器），每条产线以 --smoke-test 无头冒烟为准；
+# GUI/深色模式/安装卸载链路已在 WOA 真机人工验证。
+#
+# 打 v* tag 时自动把 5 个安装包发布到 GitHub Release；手动触发仅出 artifacts。
 
 on:
   push:
@@ -89,10 +90,10 @@ jobs:
           python _install_umid.py --platform "$PLAT" --arch "$ARCH" --dest umid \
             || echo "WARN: UMID extraction failed; gateway falls back (chat 不受影响)"
 
-      - name: Build (PyInstaller)
+      - name: Build app (PyInstaller)
         run: python -m PyInstaller desktop/qoder2api-hub.spec --noconfirm
 
-      # 无头冒烟：起网关 → /health → /v1/models → / → 优雅停机（GUI 完全不参与）
+      # 无头冒烟：起网关 → /health → /v1/models → / → 优雅停机（打包前的质量门）
       - name: Smoke test
         shell: bash
         run: |
@@ -105,31 +106,100 @@ jobs:
           "$BIN" --smoke-test --port 8799
           echo "smoke exit=$?"
 
-      - name: Package (macOS ad-hoc sign + zip)
+      # ---------------- 安装包 ----------------
+      - name: Version string
+        id: ver
+        shell: bash
+        run: |
+          # v1.2.18 → 1.2.18；v1.2.17-2-gHASH → 1.2.17.2；无 tag → 0.0.0+short
+          RAW=$(git describe --tags --always 2>/dev/null || echo v0)
+          V=$(echo "$RAW" | sed -e 's/^v//' -e 's/-g[0-9a-f]*$//' \
+              -e 's/-\([0-9]\+\)$/.\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "version: $RAW -> $V"
+
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          }
+          if (-not (Test-Path $iscc)) {
+            # windows-11-arm 产线未预装 Inno：下载 6.7.3（安装器本体 x86，
+            # WOA 仿真可跑），按用户级别静默安装
+            curl.exe -sL -o innosetup.exe `
+              "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe"
+            Start-Process -Wait -FilePath .\innosetup.exe -ArgumentList `
+              '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/CURRENTUSER'
+            $iscc = "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          }
+          $arch = if ("${{ matrix.target }}" -eq "windows-arm64") { "arm64" } `
+                  else { "x64" }
+          & $iscc "-DAppVersion=${{ steps.ver.outputs.version }}" `
+                  "-DArchTag=$arch" desktop/installer/qoder2api-hub.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Package macOS DMG
         if: runner.os == 'macOS'
         run: |
           codesign --force --deep --sign - dist/Qoder2API-Hub.app
-          ditto -c -k --sequesterRsrc --keepParent dist/Qoder2API-Hub.app \
-            Qoder2API-Hub-${{ matrix.target }}.zip
+          mkdir -p dmg
+          cp -R dist/Qoder2API-Hub.app dmg/
+          ln -s /Applications dmg/Applications
+          hdiutil create -volname "Qoder2API-Hub" -srcfolder dmg -ov \
+            -format UDZO "Qoder2API-Hub-macos-arm64.dmg"
 
-      - name: Stage artifact
-        shell: bash
+      - name: Build Linux deb
+        if: runner.os == 'Linux'
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            cp dist/Qoder2API-Hub.exe "Qoder2API-Hub-${{ matrix.target }}.exe"
-          elif [ "${{ runner.os }}" != "macOS" ]; then
-            cp dist/Qoder2API-Hub "Qoder2API-Hub-${{ matrix.target }}"
-            chmod +x "Qoder2API-Hub-${{ matrix.target }}"
-          fi
+          VER="${{ steps.ver.outputs.version }}"
+          case "${{ matrix.target }}" in
+            linux-x64)   DEBARCH=amd64; PKGARCH=x64   ;;
+            linux-arm64) DEBARCH=arm64; PKGARCH=arm64 ;;
+          esac
+          ROOT="pkg/qoder2api-hub"
+          mkdir -p "$ROOT/DEBIAN" "$ROOT/opt/qoder2api-hub" \
+                   "$ROOT/usr/share/applications" \
+                   "$ROOT/usr/share/icons/hicolor/256x256/apps"
+          install -m 755 dist/Qoder2API-Hub \
+                         "$ROOT/opt/qoder2api-hub/Qoder2API-Hub"
+          install -m 644 desktop/assets/qoder2api.png \
+                         "$ROOT/usr/share/icons/hicolor/256x256/apps/qoder2api-hub.png"
+          cat > "$ROOT/usr/share/applications/qoder2api-hub.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Qoder2API-Hub
+          Comment=Qoder -> OpenAI 兼容网关（内嵌看板）
+          Exec=/opt/qoder2api-hub/Qoder2API-Hub
+          Icon=qoder2api-hub
+          Categories=Development;Network;
+          EOF
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: qoder2api-hub
+          Version: $VER
+          Section: net
+          Priority: optional
+          Architecture: $DEBARCH
+          Maintainer: Kepler16f
+          Depends: libgl1, libegl1, libxkbcommon0, libdbus-1-3, libfontconfig1
+          Description: Qoder2API-Hub 桌面客户端（内嵌看板的 OpenAI 兼容网关）
+           安装到 /opt/qoder2api-hub；数据目录在 $HOME/.local/share/qoder2api-hub
+           （安装目录只读时桌面壳自动回退）。Linux ARM64 内嵌 UI 需
+           glibc >= 2.39（Ubuntu 24.04+ 等新发行版；旧发行版自动回退控制台模式）。
+          EOF
+          dpkg-deb --build --root-owner-group "$ROOT" \
+            "qoder2api-hub-linux-${PKGARCH}.deb"
 
-      - name: Upload artifact
+      - name: Upload artifact (installer)
         uses: actions/upload-artifact@v4
         with:
           name: Qoder2API-Hub-${{ matrix.target }}
           path: |
-            Qoder2API-Hub-${{ matrix.target }}.exe
-            Qoder2API-Hub-${{ matrix.target }}.zip
-            Qoder2API-Hub-${{ matrix.target }}
+            Qoder2API-Hub-setup-windows-*.exe
+            Qoder2API-Hub-macos-*.dmg
+            qoder2api-hub-linux-*.deb
           if-no-files-found: error
           retention-days: 14
 
@@ -152,9 +222,10 @@ jobs:
           ls -la rel/
           gh release create "$GITHUB_REF_NAME" \
             --title "Qoder2API-Hub desktop $GITHUB_REF_NAME" \
-            --notes "桌面客户端多平台产物，见 desktop/README.md 的安装与首次运行说明。
+            --notes "桌面客户端多平台安装包，安装与首次运行说明见 desktop/README.md。
 
-          - Windows x64 / ARM64（原生，双击即用，无需安装 Python）
-          - macOS Apple Silicon（zip 内为 .app，首跑右键打开绕过 Gatekeeper）
-          - Linux x64 / ARM64（单文件，chmod +x 后运行；内嵌 QtWebEngine）" \
-            rel/Qoder2API-Hub-*
+          - Windows x64 / ARM64：Inno Setup 安装包，按用户安装（无需管理员），
+            双击即用；可选桌面快捷方式
+          - macOS Apple Silicon：DMG，拖进 Applications；首跑右键打开绕过 Gatekeeper
+          - Linux x64 / ARM64：deb 包（sudo dpkg -i），装完在应用列表启动" \
+            rel/*

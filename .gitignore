@@ -29,3 +29,6 @@ python/
 # ---- 桌面客户端构建产物 ----
 /build/
 /dist/
+
+# ---- 安装器产物（本地 ISCC 输出，CI 会重建）----
+/installer-out/

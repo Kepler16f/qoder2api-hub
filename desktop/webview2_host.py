@@ -19,6 +19,7 @@
   （依据：WebView2.h 的 C 风格 vtbl 结构体声明顺序）
 """
 import ctypes
+import json
 import os
 import platform
 import threading
@@ -46,6 +47,7 @@ IID_CONTROLLER = _guid_le("4D00C0D1-9434-4EB6-8078-8697A560334F")
 IID_CTRL_HANDLER = _guid_le("6C4819F3-C9B7-4260-8127-C9F5BDE7F68C")
 IID_ENV_HANDLER = _guid_le("4E8A3389-C9D8-4BD2-B6B5-124FEE6CC14D")
 IID_EXEC_HANDLER = _guid_le("49511172-CC67-4BCA-9923-137112F4C4CC")
+IID_WEBMSG_HANDLER = _guid_le("57213F19-00E6-49FA-8E07-898EA01ECBD2")
 
 
 class RECT(ctypes.Structure):
@@ -215,6 +217,86 @@ class WebView2Host(object):
             self._fail("CreateCoreWebView2EnvironmentWithOptions "
                        "hr=0x%08X" % (hr & 0xFFFFFFFF))
         return hr
+
+    def add_init_script(self, js):
+        """⚠️ 已弃用——AddScriptToExecuteOnDocumentCreated（slot 27）会同步
+        跨进程并在内部泵消息：在 ControllerCompleted 回调里调用直接 access
+        violation，在 tk 事件回调里调用会嵌套泵消息打乱 Tcl/ctypes 的 GIL
+        状态（Fatal: PyEval_RestoreThread ... thread state is NULL）。
+        注入脚本一律改走 execute_script（导航完成后调用，实测安全）。
+        保留本方法仅为向后兼容提示，调用即抛错。"""
+        raise RuntimeError(
+            "add_init_script crashes re-entrantly; use execute_script() "
+            "after navigation instead (see comment above)")
+
+    def set_color_scheme(self, scheme):
+        """0=跟随系统 1=浅色 2=深色（ICoreWebView2_13::get_Profile 槽 105 →
+        ICoreWebView2Profile::put_PreferredColorScheme 槽 9）。
+
+        默认 Auto 本就跟随系统，通常无需调用；仅在需要强制时用。
+        失败静默（旧 runtime 无 Profile 时保持默认）。"""
+        if not self._webview:
+            return
+        try:
+            profile = c_void_p()
+            com_call(self._webview, 105, HRESULT,
+                     [POINTER(c_void_p)], byref(profile))
+            if not profile:
+                return
+            try:
+                com_call(profile, 9, HRESULT, [c_int], int(scheme))
+            finally:
+                com_call(profile, 2, c_uint32, [])   # Release
+        except Exception:
+            pass
+
+    def on_web_message(self, callback):
+        """页面 window.chrome.webview.postMessage(...) → callback(dict)。
+
+        ICoreWebView2::add_WebMessageReceived（槽 34）+ 事件处理器的
+        Invoke(槽 3)，载荷经 args::get_WebMessageAsJson（槽 4，LPWSTR 需
+        CoTaskMemFree）。看板设置页借此把开关状态回传给桌面壳。
+        """
+        if not self._webview:
+            return
+        proto = WINFUNCTYPE(HRESULT, c_void_p, c_void_p, c_void_p)
+
+        def _invoke(this, sender, args):
+            try:
+                raw = c_void_p()
+                com_call(args, 4, HRESULT, [POINTER(c_void_p)], byref(raw))
+                if raw:
+                    try:
+                        text = ctypes.wstring_at(raw)
+                    finally:
+                        ctypes.windll.ole32.CoTaskMemFree(raw)
+                else:
+                    text = "null"
+                try:
+                    payload = json.loads(text)
+                except Exception:
+                    payload = {"raw": text}
+                callback(payload)
+            except Exception as exc:
+                self._fail("web message 回调异常: %r" % exc)
+            return S_OK
+
+        handler, keep = make_handler(IID_WEBMSG_HANDLER, _invoke, proto)
+        self._keep.extend(keep)
+        token = c_void_p()
+        com_call(self._webview, 34, HRESULT, [c_void_p, POINTER(c_void_p)],
+                 handler, byref(token))
+
+    def post_message(self, obj):
+        """壳 → 页面：ICoreWebView2::PostWebMessageAsJson（槽 32）。
+        页面用 window.addEventListener('message', ...) 收（event.data 为
+        已解析对象）。"""
+        if self._webview:
+            try:
+                com_call(self._webview, 32, HRESULT, [c_wchar_p],
+                         c_wchar_p(json.dumps(obj, ensure_ascii=False)))
+            except Exception:
+                pass
 
     def navigate(self, url):
         if self._webview:
