@@ -579,6 +579,30 @@ a:hover{text-decoration:underline}
       <div id="keyList"></div>
     </section>
 
+    <section id="sectionLimits">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">事实性限额护栏 <em id="setLimitsState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.6">
+            三个作用域：<b>全局默认</b>对所有账号生效；<b>国际版 / 国内版</b> <b>留空 = 继承全局</b>，填 <b>0 = 关闭</b>该区域的这条护栏（0 不是「限制为 0」）。
+            阈值 ≤ 0 的护栏完全不生效；计数未知时按放行处理（fail-open），账号行会如实标成「未知」。
+          </div>
+        </div>
+        <button id="btnSaveLimits" onclick="saveLimits(this)">保存限额</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead>
+          <tr>
+            <th style="text-align:left;min-width:300px">护栏</th>
+            <th style="width:150px">全局默认</th>
+            <th style="width:180px">国际版</th>
+            <th style="width:180px">国内版</th>
+          </tr>
+        </thead>
+        <tbody id="limitsTbody"></tbody>
+      </table></div>
+    </section>
+
     <section>
       <h2>运行信息</h2>
       <table>
@@ -1790,6 +1814,45 @@ function toast(msg, kind){
 /* ------------------------------- accounts ------------------------------- */
 let USAGE_BY_ACCOUNT = {};
 
+// 账号行护栏状态四态（.team/_gap/03-candidate-deep-dive.md §3.4 / R2）：
+//   未启用 = 所有阈值 ≤ 0；未知 = 阈值 > 0 但计数为 null（fail-open 放行中）；
+//   已暂停 = 守卫命中；正常 = 阈值 > 0、计数已知、未命中。
+// 四态必须能区分，否则运维会把「开了但计数未知」误当成「开了没用」。
+function accountGuardBadge(a){
+  const cred = (a.credits && typeof a.credits === 'object') ? a.credits : null;
+  const parts = [], extras = [];
+  const num = v => (v === null || v === undefined) ? '未知' : fmt(v);
+  const add = (label, threshold, blocked, unknown, detail) => {
+    if(!(Number(threshold) > 0)) return;
+    const state = blocked ? 'blocked' : (unknown ? 'unknown' : 'ok');
+    parts.push({ state: state,
+      text: label + (state === 'blocked' ? '：已暂停' : (state === 'unknown' ? '：计数未知（放行中）' : '：放行'))
+            + (detail ? '（' + detail + '）' : '') });
+  };
+  add('保留积分', a.reserveCredits, a.reserveBlocked,
+      !cred || cred.remain === null || cred.remain === undefined,
+      '阈值 ' + num(a.reserveCredits) + '，余额 ' + (cred ? num(cred.remain) : '未知'));
+  add('每日 Token', a.dailyTokenLimit, a.dailyLimitBlocked,
+      a.dailyTokensToday === null || a.dailyTokensToday === undefined,
+      '阈值 ' + num(a.dailyTokenLimit) + '，今日 ' + num(a.dailyTokensToday));
+  add('每日积分', a.dailyCreditLimit, a.creditLimitReached,
+      a.dailyCreditsToday === null || a.dailyCreditsToday === undefined,
+      '阈值 ' + num(a.dailyCreditLimit) + '，今日 ' + num(a.dailyCreditsToday));
+  const blockedModels = Array.isArray(a.modelTokenBlocked) ? a.modelTokenBlocked : [];
+  if(blockedModels.length){
+    parts.push({ state: 'blocked',
+      text: '单模型 Token：已暂停（' + blockedModels.length + ' 个模型受限：' + blockedModels.slice(0, 3).join('、') + '）' });
+  }
+  if(Number(a.expiringWindowDays) > 0){
+    extras.push('临期优先窗口 ' + a.expiringWindowDays + ' 天' + (a.inExpiringWindow ? '（本号在窗口内，优先派发）' : ''));
+  }
+  const title = esc(parts.map(p => p.text).concat(extras).join('；') || '所有护栏阈值均为 0：未启用');
+  if(!parts.length) return '<span class="badge off" title="' + title + '">未启用</span>';
+  if(parts.some(p => p.state === 'blocked')) return '<span class="badge bad" title="' + title + '">已暂停</span>';
+  if(parts.some(p => p.state === 'unknown')) return '<span class="badge warn" title="' + title + '">未知</span>';
+  return '<span class="badge ok" title="' + title + '">正常</span>';
+}
+
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -1815,6 +1878,7 @@ function accountRow(a){
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
+    + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
     + '<td style="text-align:left;white-space:nowrap">' + credText + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
@@ -1860,6 +1924,7 @@ function renderAccounts(){
     + '<th style="text-align:center;width:76px">版本</th>'
     + '<th style="text-align:left">账号</th>'
     + '<th style="text-align:center;width:84px">状态</th>'
+    + '<th style="text-align:center;width:96px">护栏</th>'
     + '<th style="text-align:left;width:120px">积分</th>'
     + '<th style="text-align:right;width:70px">请求</th>'
     + '<th style="text-align:right;width:88px">总 token</th>'
@@ -2763,6 +2828,7 @@ async function loadSettings(showToast){
     set('setUsageDir', data.usage_dir);
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
+    renderLimits(data.limits || null);   // 后端 GET /settings 带回 limits 时才允许保存（见 saveLimits 的护栏）
     if(showToast) toast('设置已刷新', 'ok');
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
@@ -3057,6 +3123,125 @@ async function saveApiKeys(btn){
     toast('保存失败: ' + e.message, 'bad');
   } finally {
     if(btn) btn.disabled = false;
+  }
+}
+
+/* ---- 事实性限额护栏（5 键 × global / intl / cn，与后端 qoder_settings.LIMIT_KEYS 一一对应）----
+   语义：留空 = 继承 global；显式 0 = 关闭（0 不是「限制为 0」）；阈值 ≤ 0 的护栏完全不生效。
+   量纲：credits 类护栏的单位是**积分点数**（实测账号区间 0~1100），不是 token 量级。 */
+const LIMIT_FIELDS = [
+  { key: 'reserve_credits', label: '保留积分（余额地板）', unit: '积分点数', step: 10,
+    hint: '账号余额 ≤ 该值时暂停接单，避免余额用尽后触发上游短信提醒。单位是积分点数（实测账号区间 0~1100），不是 token —— 照 token 量级填会永远拦不到任何账号。' },
+  { key: 'daily_token_limit', label: '每日 Token 限额', unit: 'token', step: 1000000,
+    hint: '该账号当日累计 token 达到该值后暂停接单，请求自动切到其他账号；本地时间 0 点后恢复。单位是 token。' },
+  { key: 'daily_credit_limit', label: '每日积分限额', unit: '积分点数', step: 50,
+    hint: '该账号当日累计消耗积分达到该值后暂停接单（免费模型不计入）。单位是积分点数，不是 token。' },
+  { key: 'model_daily_token_limit', label: '单模型每日 Token 限额', unit: 'token', step: 1000000,
+    hint: '同一账号对同一个模型的当日 token 用量达到该值后，只暂停该模型的接单，其余模型照常。单位是 token。' },
+  { key: 'expiring_window_days', label: '临期优先窗口', unit: '天', step: 1,
+    hint: '余额将在该天数内到期的账号优先派发（0 = 关闭该偏好）。这是调度偏好，不是拦截护栏。' },
+];
+const LIMIT_SCOPES = [
+  { scope: 'global', prefix: '全局默认' },
+  { scope: 'intl', prefix: '国际版' },
+  { scope: 'cn', prefix: '国内版' },
+];
+const limitElId = (scope, key) => 'lim-' + scope + '-' + key;
+let LIMITS_LOADED = false;   // GET /settings 是否已带回 limits：没读到就不允许保存，避免把已有阈值覆盖成 0
+
+function limitNote(scope, unit, globalValue, raw){
+  if(scope === 'global') return globalValue > 0 ? ('全局阈值 ' + globalValue + ' ' + unit) : '0 = 关闭这条护栏';
+  if(raw === null || raw === undefined) {
+    return globalValue > 0
+      ? ('继承全局 ' + globalValue + ' ' + unit)
+      : '继承全局（global 为 0 → 本区域关闭）';
+  }
+  return Number(raw) === 0 ? '关闭（本区域不启用）' : ('本区域独立限额 ' + raw + ' ' + unit);
+}
+
+function renderLimits(limits){
+  const tbody = document.getElementById('limitsTbody');
+  if(!tbody) return;
+  LIMITS_LOADED = !!limits;
+  const anyOverride = limits ? LIMIT_FIELDS.some(f => {
+    const e = limits[f.key] || {};
+    return (e.intl !== null && e.intl !== undefined) || (e.cn !== null && e.cn !== undefined);
+  }) : false;
+  const stateEl = document.getElementById('setLimitsState');
+  if(stateEl){
+    stateEl.textContent = limits ? (anyOverride ? '(含区域覆盖)' : '(仅全局)') : '(未读到现有配置)';
+    stateEl.style.color = limits ? 'var(--accent2)' : 'var(--warn)';
+  }
+  const saveBtn = document.getElementById('btnSaveLimits');
+  if(saveBtn){
+    saveBtn.disabled = !limits;
+    saveBtn.title = limits ? '' : '未从后端读到现有 limits，保存会把已有阈值覆盖成 0，已暂时禁用';
+  }
+  tbody.innerHTML = LIMIT_FIELDS.map(f => {
+    const e = (limits && limits[f.key]) || {};
+    const globalValue = Number(e.global || 0);
+    const cells = LIMIT_SCOPES.map(s => {
+      const raw = s.scope === 'global' ? globalValue : e[s.scope];
+      const inherited = s.scope !== 'global' && (raw === null || raw === undefined);
+      const input = '<input id="' + limitElId(s.scope, f.key) + '" class="limit-input" type="number" min="0" step="' + f.step + '"'
+        + (inherited ? ' placeholder="继承全局 ' + globalValue + '"' : ' value="' + Number(raw) + '"')
+        + ' oninput="syncLimitNotes()"'
+        + ' style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">';
+      return '<td style="text-align:left">'
+        + input
+        + '<div data-note-for="' + limitElId(s.scope, f.key) + '" style="font-size:11px;color:var(--dim);margin-top:3px;line-height:1.4">'
+        + limitNote(s.scope, f.unit, globalValue, raw) + '</div>'
+        + '</td>';
+    }).join('');
+    return '<tr>'
+      + '<td style="text-align:left">'
+      +   '<div style="font-weight:600;color:var(--fg);font-size:13px">' + f.label + '</div>'
+      +   '<div style="font-size:11px;color:var(--dim);margin-top:2px;line-height:1.5">' + f.hint + '</div>'
+      + '</td>' + cells + '</tr>';
+  }).join('');
+  syncLimitNotes();
+}
+
+// 输入变化时实时刷新说明：改了 global 就立刻反映到「继承全局 N」上，别让用户对着一句旧说明取舍
+function syncLimitNotes(){
+  LIMIT_FIELDS.forEach(f => {
+    const gEl = document.getElementById(limitElId('global', f.key));
+    const globalValue = (gEl && gEl.value !== '') ? Math.max(0, parseInt(gEl.value, 10) || 0) : 0;
+    ['intl', 'cn'].forEach(scope => {
+      const el = document.getElementById(limitElId(scope, f.key));
+      const note = document.querySelector('[data-note-for="' + limitElId(scope, f.key) + '"]');
+      if(!el || !note) return;
+      const blank = (el.value === '');
+      if(blank) el.placeholder = '继承全局 ' + globalValue;
+      note.textContent = limitNote(scope, f.unit, globalValue, blank ? null : el.value);
+    });
+  });
+}
+
+async function saveLimits(btn){
+  if(!LIMITS_LOADED){
+    toast('未从后端读到现有 limits：为避免把已有阈值覆盖成 0，保存已禁用', 'warn');
+    return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = '保存中...'; }
+  try{
+    const payload = {};
+    LIMIT_FIELDS.forEach(f => {
+      const scopes = {};
+      LIMIT_SCOPES.forEach(s => {
+        const el = document.getElementById(limitElId(s.scope, f.key));
+        // 空串交给后端语义：global 空 → 0（关）；intl/cn 空 → None（继承）
+        scopes[s.scope] = el ? String(el.value).trim() : '';
+      });
+      payload[f.key] = scopes;
+    });
+    const r = await postJSON('/settings/save', {limits: payload});
+    if(r && r.limits){ renderLimits(r.limits); toast('限额已保存', 'ok'); }
+    else { toast('限额已保存，但后端未回传归一化结果，正在重新读取…', 'warn'); loadSettings(); }
+  }catch(e){
+    toast('保存限额失败: ' + e.message, 'bad');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '保存限额'; }
   }
 }
 

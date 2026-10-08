@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.19"
+VERSION = "1.3.0"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -366,7 +366,19 @@ def _extract_usage(usage):
     }
 
 
+def realm_scope(value):
+    """面板 realm 取值的归一：显式 "all"（大小写不敏感）= 全部区域 → None（无过滤）。
+
+    只有字面 "all" 被当作通配：None / "" 本来就表示"无过滤"（各路由会先回落到
+    CURRENT_REALM 再传进来），"cn" / "intl" / 其它未知值**一律原样保留既有语义**
+    （按字面比较；未知值自然过滤出空集 —— 不在这里替面板猜意图）。
+    """
+    v = str(value if value is not None else "").strip()
+    return None if v.lower() in ("", "all") else v
+
+
 def row_matches_realm(row, realm):
+    realm = realm_scope(realm)
     if not realm:
         return True
     r = row.get("realm")
@@ -518,31 +530,100 @@ def _pct(values, q):
     return ordered[max(0, min(len(ordered) - 1, idx))]
 
 
+# ---------------------------------------------------------------------------
+# 时间窗口：?range=day|week|month|all|custom&since=&until=
+# ---------------------------------------------------------------------------
+# 语义（与面板选择器、wb 参考实现一致）：day/week/month 是**锚到本地零点**的日历
+# 窗口（week 从周一起算、month 从 1 号起算），custom 取面板传来的两个 epoch（任一端
+# 可缺省，反了自动交换），all / 空 / 未知值 = 不设窗口（历史全量）。返回 (since, until)，
+# None 表示该侧无界；两侧都 None 时下游**完全不做过滤**（_row_in_window 直接返回 True，
+# 连 at 都不读），因此不传 range 的输出与改动前逐字节一致。
+def _epoch_or_none(value):
+    """面板传来的 epoch 秒；负值/不可解析一律丢弃（不做钳制，宁可不设界）。"""
+    if value in (None, "", False):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _local_midnight(days_back=0):
+    lt = time.localtime(time.time() - days_back * 86400)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+
+
+def range_window(value, since=None, until=None):
+    v = str(value or "").strip().lower()
+    if v in ("today", "day", "1d"):
+        return _local_midnight(), None
+    if v in ("week", "w"):
+        return _local_midnight(days_back=time.localtime().tm_wday), None
+    if v in ("month", "m"):
+        lt = time.localtime()
+        return time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1)), None
+    if v == "custom":
+        lo, hi = _epoch_or_none(since), _epoch_or_none(until)
+        if lo is not None and hi is not None and hi < lo:
+            lo, hi = hi, lo
+        return lo, hi
+    return None, None
+
+
+def range_query(query):
+    """从 parse_qs 的查询串里取 (range, since, until)；缺省一律 None。"""
+    def first(name):
+        values = query.get(name) or [None]
+        return values[0] if values else None
+    return first("range"), first("since"), first("until")
+
+
+def _row_in_window(row, since, until):
+    """窗口过滤：两侧都 None 时不做任何读取（老路径零开销、零差异）。"""
+    if since is None and until is None:
+        return True
+    at = row.get("at")
+    if not isinstance(at, (int, float)):
+        at = 0
+    if since is not None and at < since:
+        return False
+    if until is not None and at > until:
+        return False
+    return True
+
+
 _perf_cache = {}
 _perf_lock = threading.Lock()
 
 
-def perf_stats(sample=5000, realm=None, ttl=10):
+def perf_stats(sample=5000, realm=None, ttl=10, range=None, since=None, until=None):
     """Cached wrapper: parsing thousands of rows is CPU-heavy, and the
     dashboard polls this endpoint every few seconds."""
     r = realm or CURRENT_REALM
+    lo, hi = range_window(range, since, until)
     try:
-        key = (int(sample), r)
+        # 缓存键带上**解析后的边界**（不是 range 标签）：week 与 month 相互重叠，
+        # 一个标签无法描述两个窗口，否则会拿一个窗口的数据冒充另一个。
+        key = (int(sample), r, lo, hi)
     except Exception:
-        key = (5000, r)
+        key = (5000, r, lo, hi)
     now = time.time()
     with _perf_lock:
         hit = _perf_cache.get(key)
         if hit is not None and (now - hit[0]) < ttl:
             return hit[1]
-    data = _perf_stats_uncached(sample, realm)
+    data = _perf_stats_uncached(sample, realm, since=lo, until=hi)
     with _perf_lock:
         _perf_cache[key] = (time.time(), data)
     return data
 
 
-def _perf_stats_uncached(sample=5000, realm=None):
-    """Latency percentiles + derived rates, computed from the JSONL log."""
+def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
+    """Latency percentiles + derived rates, computed from the JSONL log.
+
+    since/until 为窗口边界（None=该侧无界）；两者都 None 时行为与改动前一致。
+    """
     ttfts, gens, walls, rates, hits, tok_rates = [], [], [], [], [], []
     total = ok = err = 0
     m_buckets = {}
@@ -557,6 +638,8 @@ def _perf_stats_uncached(sample=5000, realm=None):
         except Exception:
             continue
         if realm and not row_matches_realm(r, realm):
+            continue
+        if not _row_in_window(r, since, until):
             continue
         total += 1
         if r.get("error"):
@@ -748,6 +831,7 @@ def _tail_lines(path, max_lines, chunk=256 * 1024):
 
 def count_usage_rows(realm=None):
     """Cheap row count - substring match instead of a full JSON parse."""
+    realm = realm_scope(realm)      # realm=all 走无 needles 分支，与逐行过滤一致
     needles = ()
     if realm:
         needles = ('"realm": "%s"' % realm, '"realm":"%s"' % realm)
@@ -897,7 +981,9 @@ def account_views(realm=None):
 _CREDITS_SUMMARY_NOTE = ("registered values only; freshness depends on "
                          "check-in and consumption write-back")
 
-_byacct_cache = {"at": 0.0, "data": None}
+# 按**解析后的窗口边界**分键：(since, until) -> (at, data)。week/month 相互重叠，
+# 一个"范围标签"键会让一个窗口的数据冒充另一个（见 range_window 的注释）。
+_byacct_cache = {}
 _byacct_lock = threading.Lock()
 
 
@@ -944,21 +1030,23 @@ def credits_summary():
     }
 
 
-def usage_by_account(ttl=10):
+def usage_by_account(ttl=10, range=None, since=None, until=None):
     """Cached wrapper: full aggregation over the whole log is expensive."""
+    lo, hi = range_window(range, since, until)
     now = time.time()
+    key = (lo, hi)
     with _byacct_lock:
-        if _byacct_cache["data"] is not None and (now - _byacct_cache["at"]) < ttl:
-            return _byacct_cache["data"]
-    data = _usage_by_account_uncached()
+        hit = _byacct_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+    data = _usage_by_account_uncached(since=lo, until=hi)
     with _byacct_lock:
-        _byacct_cache["at"] = time.time()
-        _byacct_cache["data"] = data
+        _byacct_cache[key] = (time.time(), data)
     return data
 
 
-def _usage_by_account_uncached():
-    """Aggregate the JSONL log per account id."""
+def _usage_by_account_uncached(since=None, until=None):
+    """Aggregate the JSONL log per account id（可选窗口过滤）。"""
     buckets = {}
     try:
         with open(USAGE_LOG, encoding="utf-8") as fh:
@@ -971,6 +1059,8 @@ def _usage_by_account_uncached():
                 except Exception:
                     continue
                 if row.get("error"):
+                    continue
+                if not _row_in_window(row, since, until):
                     continue
                 key = row.get("account") or "(unattributed)"
                 bucket = buckets.setdefault(key, {
@@ -995,10 +1085,127 @@ def _usage_by_account_uncached():
     return out
 
 
-def compute_usage_analytics():
-    """Detailed analytics for Token, Cache, and Reasoning metrics page."""
+_series_cache = {}
+_series_lock = threading.Lock()
+
+
+def usage_timeseries(realm=None, range=None, since=None, until=None,
+                     bucket_seconds=None, ttl=10):
+    """分桶的 token/积分时序（面板时序图）。
+
+    桶宽随窗口自适应：minute（span <= 6h）/ hour（<= 14d）/ day（其余），
+    显式 bucket_seconds 覆盖（下限 60 秒）。计数口径与 KPI/模型表一致：
+    非 error 行计入 requests 与各 token 字段，error 行计入 errors；credit 对
+    所有行累加（与 _usage_snapshot_uncached 的 USAGE_FIELDS 口径相同）。
+    最近 50 条 credit > 0 的请求随行返回，面板无需再打一个端点。
+
+    缓存按**解析后的边界 + 桶宽**分键：week/month 相互重叠，一个"范围标签"
+    无法描述两个窗口；桶宽不同即载荷不同（自动桶宽会随 span 翻转）。
+    """
+    r = realm or CURRENT_REALM
+    lo, hi = range_window(range, since, until)
+    pinned_lo, pinned_hi = lo, hi
+    # 「显式给了窗口参数」与「完全没给」必须分开：
+    #   · 没给（老面板/裸调用）→ 图表默认看最近 24 小时（改动前的既有行为）；
+    #   · 给了 range=all（或 custom 但只给了一端）→ 该侧是**真的无界**，
+    #     不能悄悄缩成 24 小时，否则 KPI(range=all=全量) 与序列(近 24h) 不自洽。
+    explicit = not (range is None and since is None and until is None)
+    if hi is None:
+        hi = time.time()
+    if lo is None:
+        lo = 0 if explicit else hi - 86400
+    span = max(1.0, hi - lo)
+    if bucket_seconds:
+        step = max(60, int(bucket_seconds))
+    elif span <= 6 * 3600:
+        step = 60
+    elif span <= 14 * 86400:
+        step = 3600
+    else:
+        step = 86400
+    now = time.time()
+    edge = "unbounded" if explicit else "auto"
+    key = (r or "all", pinned_lo if pinned_lo is not None else edge,
+           pinned_hi if pinned_hi is not None else edge, step)
+    with _series_lock:
+        hit = _series_cache.get(key)
+        if hit is not None and (now - hit[0]) < ttl:
+            return hit[1]
+    data = _usage_timeseries_uncached(r, lo, hi, step)
+    with _series_lock:
+        _series_cache[key] = (time.time(), data)
+    return data
+
+
+def _usage_timeseries_uncached(realm, lo, hi, step):
+    """One uncached pass over the log, folding rows into fixed-width buckets."""
+    buckets = {}
+    credits = []
+    try:
+        with open(USAGE_LOG, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if realm and not row_matches_realm(row, realm):
+                    continue
+                at = row.get("at")
+                at = at if isinstance(at, (int, float)) else 0
+                if at < lo or at > hi:
+                    continue
+                key = int((at - lo) // step)
+                bucket = buckets.setdefault(key, {
+                    "at": lo + key * step, "requests": 0, "errors": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                    "reasoning_tokens": 0, "cached_tokens": 0,
+                    "total_tokens": 0, "credit": 0.0,
+                })
+                if row.get("error"):
+                    bucket["errors"] += 1
+                else:
+                    bucket["requests"] += 1
+                    for field in ("prompt_tokens", "completion_tokens",
+                                  "reasoning_tokens", "cached_tokens",
+                                  "total_tokens"):
+                        bucket[field] += (row.get(field) or 0)
+                credit = row.get("credit") or 0
+                bucket["credit"] += credit
+                if credit > 0:
+                    credits.append({
+                        "at": at, "iso": row.get("iso") or "",
+                        "model": row.get("model") or "",
+                        "account": row.get("account") or "",
+                        "credit": credit,
+                        "total_tokens": row.get("total_tokens") or 0,
+                    })
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        log("usage timeseries read failed: %s" % exc)
+    credits.sort(key=lambda item: item.get("at") or 0, reverse=True)
+    return {
+        "ok": True, "realm": realm or "all", "bucket_seconds": step,
+        "since": lo, "until": hi,
+        "series": [buckets[key] for key in sorted(buckets)],
+        "credits": credits[:50],
+    }
+
+
+def compute_usage_analytics(range=None, since=None, until=None):
+    """Detailed analytics for Token, Cache, and Reasoning metrics page.
+
+    range/since/until 为可选时间窗口，语义见 range_window()。**不传时是 legacy
+    模式：不新增任何键、不过滤任何行**，输出与改动前逐字节一致（老面板不受影响）；
+    传了才追加顶层 window 边界、summary.window 桶与每账号/每模型的 window 桶。
+    """
     now = time.localtime()
     today_ts = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1))
+    lo, hi = range_window(range, since, until)
+    legacy = (not str(range or "").strip() and since is None and until is None)
 
     def new_stat():
         return {
@@ -1012,6 +1219,10 @@ def compute_usage_analytics():
 
     all_summary = new_stat()
     today_summary = new_stat()
+    # 窗口桶：legacy 模式下不进入输出，但循环结构保持统一（避免复制一份过滤逻辑）
+    window_summary = new_stat()
+    win_acct = {}       # uid -> {"stat": stat, "models": {model: {...}}}
+    win_model = {}      # model id -> stat
     acct_map = {}
     model_map = {}
     if os.path.exists(USAGE_LOG):
@@ -1028,6 +1239,7 @@ def compute_usage_analytics():
                     is_err = bool(r.get("error"))
                     at = r.get("at", 0)
                     is_today = (at >= today_ts)
+                    in_window = _row_in_window(r, lo, hi)
                     acct_uid = r.get("account") or "(unattributed)"
                     m_id = r.get("model") or "(unknown)"
 
@@ -1054,6 +1266,8 @@ def compute_usage_analytics():
                     feed(all_summary, is_err)
                     if is_today:
                         feed(today_summary, is_err)
+                    if in_window:
+                        feed(window_summary, is_err)
                     if acct_uid not in acct_map:
                         acct_map[acct_uid] = {
                             "uid": acct_uid,
@@ -1068,6 +1282,16 @@ def compute_usage_analytics():
                     feed(acct_map[acct_uid]["all_time"], is_err)
                     if is_today:
                         feed(acct_map[acct_uid]["today"], is_err)
+                    if in_window:
+                        slot = win_acct.setdefault(
+                            acct_uid, {"stat": new_stat(), "models": {}})
+                        feed(slot["stat"], is_err)
+                        if not is_err:
+                            wm = slot["models"].setdefault(
+                                m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
+                            wm["requests"] += 1
+                            wm["tokens"] += (r.get("total_tokens") or 0)
+                            wm["reasoning"] += (r.get("reasoning_tokens") or 0)
                     if not is_err:
                         tm = acct_map[acct_uid]["all_models"].setdefault(
                             m_id, {"requests": 0, "tokens": 0, "reasoning": 0})
@@ -1086,6 +1310,8 @@ def compute_usage_analytics():
                     feed(model_map[m_id]["all_time"], is_err)
                     if is_today:
                         feed(model_map[m_id]["today"], is_err)
+                    if in_window:
+                        feed(win_model.setdefault(m_id, new_stat()), is_err)
         except Exception as exc:
             log("compute_usage_analytics failed: %s" % exc)
     if POOL:
@@ -1131,18 +1357,62 @@ def compute_usage_analytics():
     for m in model_map.values():
         finalize(m["today"])
         finalize(m["all_time"])
+    if not legacy:
+        finalize(window_summary)
+        for slot in win_acct.values():
+            finalize(slot["stat"])
+        for stat in win_model.values():
+            finalize(stat)
     accts_list = sorted(acct_map.values(),
                         key=lambda a: (-a["today"]["total_tokens"],
                                        -a["all_time"]["total_tokens"]))
     models_list = sorted(model_map.values(),
                          key=lambda m: (-m["today"]["total_tokens"],
                                         -m["all_time"]["total_tokens"]))
-    return {
+    result = {
         "today_ts": today_ts,
         "summary": {"today": today_summary, "all_time": all_summary},
         "accounts": accts_list,
         "models": models_list,
     }
+    if not legacy:
+        # 只在实际传了窗口时追加这三个桶；legacy 输出逐字节不变（老面板零影响）。
+        # 排序仍沿用 today/all_time（面板可自行按 window 重排），避免改变既有顺序。
+        result["window"] = {"since": lo, "until": hi}
+        result["summary"]["window"] = window_summary
+        for a in accts_list:
+            slot = win_acct.get(a["uid"])
+            a["window"] = slot["stat"] if slot else finalize(new_stat())
+            a["window_models"] = slot["models"] if slot else {}
+        for m in models_list:
+            m["window"] = win_model.get(m["model"]) or finalize(new_stat())
+    return result
+
+
+def free_model_names(realm=None):
+    """目录里 is_free 的模型名集合（含上游 key 与别名）。
+
+    与护栏阈值**同批**推给池（R3）：free 名单为空集时 credit 守卫会拦住
+    全部模型，所以只要启用了 daily_credit_limit，名单就必须一起推。
+    只读本地目录快照，不联网；失败只记 WARN 并返回已收集部分。
+    """
+    names = set()
+    try:
+        for mid, meta in fetch_models(realm=realm or CURRENT_REALM):
+            meta = meta if isinstance(meta, dict) else {}
+            if not meta.get("is_free"):
+                continue
+            vals = [mid, meta.get("key"), meta.get("alias"),
+                    meta.get("display_name")]
+            extra = meta.get("aliases")
+            if isinstance(extra, (list, tuple, set)):
+                vals.extend(extra)
+            for cand in vals:
+                if isinstance(cand, str) and cand.strip():
+                    names.add(cand.strip())
+    except Exception as exc:
+        log("free model list probe failed: %s" % exc, level="WARN")
+    return names
 
 
 def runtime_settings_view():
@@ -1173,6 +1443,10 @@ def runtime_settings_view():
         "api_key_masked": masked,
         "auth_required": auth_required(),
         "api_keys": keys,
+        # limits 与保存分支同源：limits_data 返回**完整形状**（每个守卫都补齐
+        # global/intl/cn，未设时全为 0/None），面板读到即可安全回显、再保存不会
+        # 把已有阈值覆盖成默认值。
+        "limits": qoder_settings.limits_data(ACCOUNTS_DIR),
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
@@ -5412,11 +5686,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/usage/analytics":
             if not self._authorized():
                 return
-            return self._json(200, compute_usage_analytics())
+            # ?range=day|week|month|all|custom&since=&until=（不传 = 历史全量，
+            # 输出与改动前逐字节一致；语义见 range_window）
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, compute_usage_analytics(
+                range=req_range, since=req_since, until=req_until))
         if path == "/usage/by-account":
             if not self._authorized():
                 return
-            return self._json(200, {"accounts": usage_by_account()})
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, {"accounts": usage_by_account(
+                range=req_range, since=req_since, until=req_until)})
         if path == "/usage/perf":
             if not self._authorized():
                 return
@@ -5427,7 +5707,22 @@ class Handler(BaseHTTPRequestHandler):
                 sample = 5000
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
-            return self._json(200, perf_stats(sample, realm=req_realm))
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, perf_stats(sample, realm=req_realm,
+                                              range=req_range,
+                                              since=req_since,
+                                              until=req_until))
+        if path == "/usage/timeseries":
+            if not self._authorized():
+                return
+            # 时序图：分桶 token/积分序列（桶宽自适应，可 ?bucket= 覆盖）
+            req_realm = query.get("realm", [None])[0] \
+                or self.headers.get("X-Realm") or CURRENT_REALM
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, usage_timeseries(
+                realm=req_realm, range=req_range, since=req_since,
+                until=req_until,
+                bucket_seconds=(query.get("bucket") or [None])[0]))
         if path == "/tasks":
             if not self._authorized():
                 return
@@ -5618,6 +5913,37 @@ class Handler(BaseHTTPRequestHandler):
             API_KEY = new_key
             API_KEY_FILE_SET = True
             reply["api_key_set"] = bool(new_key)
+        if "limits" in payload:
+            raw_limits = payload.get("limits")
+            if not isinstance(raw_limits, dict):
+                return self._error(400, "limits must be an object",
+                                   "invalid_request_error")
+            # 先全量校验、后落盘：避免一半合法一半 400 时留下部分应用。
+            updates = []
+            for key, scopes in raw_limits.items():
+                if key not in qoder_settings.LIMIT_KEYS:
+                    return self._error(400, "unknown limit: %s" % key,
+                                       "invalid_request_error")
+                if not isinstance(scopes, dict):
+                    return self._error(400, "limits.%s must be an object" % key,
+                                       "invalid_request_error")
+                for scope, value in scopes.items():
+                    if scope not in qoder_settings.LIMIT_SCOPES:
+                        return self._error(400, "unknown scope: %s" % scope,
+                                           "invalid_request_error")
+                    updates.append((key, scope, value))
+            for key, scope, value in updates:
+                qoder_settings.set_limit(ACCOUNTS_DIR, key, scope, value)
+            reply["limits"] = qoder_settings.limits_data(ACCOUNTS_DIR)
+            # task-61：保存后立刻推给池（阈值 + free 名单同批），让配置真正生效；
+            # 推完若某个阈值 > 0，池会自行惰性启动后台余额刷新线程。
+            try:
+                POOL.apply_settings(limits_data=reply["limits"],
+                                    free_models=free_model_names(CURRENT_REALM))
+            except Exception as exc:
+                reply["limits_apply_error"] = str(exc)
+                log("quota limits apply failed after save: %s" % exc,
+                    level="WARN")
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
@@ -5824,11 +6150,13 @@ class Handler(BaseHTTPRequestHandler):
                     "credits": res.get("credits"),
                     # issue #20：透传 qoder_tasks 的精确结论（前端一直在读
                     # message / claimed / next_available_*，此前永远 undefined）。
-                    # 新增而非替换：msg/logs/credits 原样保留；老路径没有
-                    # 这些 key 时为 None（前端有兼容层），不编造默认值、
-                    # 也不参与签到主流程判定。
+                    # 新增而非替换：msg/logs/credits 原样保留。naonao 的契约
+                    # （qoder_tasks 活动平台路径）保证 claimed 是**字符串列表**；
+                    # 老路径（旧 sash 兜底）不带该键 -> 这里统一给 []，
+                    # 让前端只需 Array.isArray 判定，不用再判 None。
+                    # message / next_available_* 缺失时仍为 None（不编造）。
                     "message": res.get("message"),
-                    "claimed": res.get("claimed"),
+                    "claimed": res.get("claimed") or [],
                     "next_available_at": res.get("next_available_at"),
                     "next_available_note": res.get("next_available_note"),
                 })
@@ -6554,6 +6882,13 @@ def main():
     POOL = qoder_accounts.AccountPool(ACCOUNTS_DIR, log=log)
     POOL.load()
     load_persisted_realm()
+    # task-61：把设置里的护栏阈值 + free 名单**同批**推给池（R3）；阈值全 0 时
+    # 不产生任何副作用，任一 > 0 则惰性启动后台上新线程（G1 的恢复路径）。
+    try:
+        POOL.apply_settings(limits_data=qoder_settings.limits_data(ACCOUNTS_DIR),
+                            free_models=free_model_names(CURRENT_REALM))
+    except Exception as exc:
+        log("quota limits apply failed at startup: %s" % exc, level="WARN")
     from qoder_scheduler import Scheduler
     SCHEDULER = Scheduler(POOL)
     SCHEDULER.start()

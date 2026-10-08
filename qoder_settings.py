@@ -301,3 +301,123 @@ class PanelSessions(object):
     def revoke_all(self):
         with self._lock:
             self._tokens.clear()
+
+
+# ---------------------------------------------------------------- limits
+# 四个守卫共享同一形状：一个覆盖双区域的 global 默认值 + 可选的 per-realm
+# override。**留空 = 继承 global**（与显式 0 = "关闭"严格区分）；从不碰这份
+# 配置的安装，行为与没有它完全一致。形状照抄 wb_settings.py 的三条读/写入口
+# + 分组 map，但 qoder 侧 **默认值全部为 0（关闭）**——量纲尚未核对
+# （.team/_gap/03-candidate-deep-dive.md R4），不给任何非零默认。
+LIMIT_KEYS = ("reserve_credits", "daily_token_limit",
+              "daily_credit_limit", "model_daily_token_limit",
+              "expiring_window_days")
+LIMIT_REALMS = ("intl", "cn")
+LIMIT_SCOPES = ("global",) + LIMIT_REALMS
+LIMITS_KEY = "limits"
+
+
+def _empty_limit_entry():
+    """一个守卫的空条目：global 默认 0（关），两个 realm 槽位 None=继承。"""
+    return {"global": 0, "intl": None, "cn": None}
+
+
+def _coerce_global(value):
+    """global 阈值：垃圾值与负数收敛到 0（关）。"""
+    try:
+        number = int(value or 0)
+    except (TypeError, ValueError):
+        number = 0
+    return max(0, number)
+
+
+def _coerce_override(value):
+    """per-realm override：None/空串="继承 global"（与显式 0="本区域关闭"不同）。"""
+    if value is None or value == "":
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, number)
+
+
+def _normalize_limits(raw):
+    """把存储的 map 补全成完整形状（部分/手改的 settings.json 也安全读）。"""
+    limits = {}
+    for key in LIMIT_KEYS:
+        entry = raw.get(key)
+        if not isinstance(entry, dict):
+            entry = {}
+        global_raw = entry.get("global")
+        # 缺省 global → 0（关）；显式 0 是真实的"关"，不会被误重新打开。
+        limits[key] = {
+            "global": 0 if global_raw is None else _coerce_global(global_raw),
+            "intl": _coerce_override(entry.get("intl")),
+            "cn": _coerce_override(entry.get("cn")),
+        }
+    return limits
+
+
+def limits_data(accounts_dir):
+    """分组后的 limits map（每个守卫都补全为完整形状）。
+
+    qoder 从未有过旧扁平键，因此不做 wb 的 _fold_legacy_limits 迁移分支。
+    """
+    with _lock:
+        raw = load(accounts_dir).get(LIMITS_KEY)
+        return _normalize_limits(raw if isinstance(raw, dict) else {})
+
+
+def limit_value(accounts_dir, key, realm=None):
+    """单守卫、单区域的**生效值**。
+
+    realm 为 intl/cn 且有 override 时用 override，否则回落 global；
+    未知 key 读作 0（关），不卡请求路径（与 wb 同语义）。
+    """
+    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
+    if realm in LIMIT_REALMS:
+        override = entry.get(realm)
+        if override is not None:
+            return override
+    return entry.get("global") or 0
+
+
+def limit_values(accounts_dir, key):
+    """单守卫 → {"global": g, "intl": ..., "cn": ...}（intl/cn 已把 global 填好）。
+
+    热路径上每个账号按自己的 realm 取一次即可；保证三键齐全且 intl/cn 非
+    None（验收 A5）。
+    """
+    entry = limits_data(accounts_dir).get(key) or _empty_limit_entry()
+    global_value = entry.get("global") or 0
+    values = {"global": global_value}
+    for realm in LIMIT_REALMS:
+        override = entry.get(realm)
+        values[realm] = global_value if override is None else override
+    return values
+
+
+def set_limit(accounts_dir, key, scope, value):
+    """落盘单个守卫的单个作用域；返回该守卫的完整条目。
+
+    key 不在 LIMIT_KEYS、scope 不在 LIMIT_SCOPES 时抛 ValueError；
+    scope="global" 恒存数字（None/垃圾→0）；intl/cn 传 None/空串 =
+    清除 override 回到继承。
+    """
+    if key not in LIMIT_KEYS:
+        raise ValueError("unknown limit: %s" % key)
+    if scope not in LIMIT_SCOPES:
+        raise ValueError("unknown scope: %s" % scope)
+    with _lock:
+        data = load(accounts_dir)
+        raw = data.get(LIMITS_KEY)
+        limits = _normalize_limits(raw if isinstance(raw, dict) else {})
+        entry = limits[key]
+        if scope == "global":
+            entry["global"] = _coerce_global(value)
+        else:
+            entry[scope] = _coerce_override(value)
+        data[LIMITS_KEY] = limits
+        save(accounts_dir, data)
+    return entry

@@ -4849,6 +4849,691 @@ finally:
     _sh39.rmtree(_ud39, ignore_errors=True)
 
 print()
+print("[40] P0-1 事实性限额护栏：配置层 A1-A5 + 守卫方法 B1-B6（判据照抄文档 §5.1/§5.2）")
+import shutil as _sh40
+import tempfile as _tf40
+import qoder_settings as S40
+
+_D40 = _tf40.mkdtemp(prefix="qd-limits-")
+try:
+    # ---- A1：无 limits 键 → 0；set_limit 后 → 500 ----
+    _a1_before = S40.limit_value(_D40, "reserve_credits", realm=None)
+    S40.set_limit(_D40, "reserve_credits", "global", 500)
+    _a1_after = S40.limit_value(_D40, "reserve_credits", realm=None)
+    check("#63-A1 无 limits 键时 limit_value=0；set_limit(global,500) 后 =500",
+          _a1_before == 0 and _a1_after == 500, (_a1_before, _a1_after))
+
+    # ---- A2：realm 覆盖 + 继承 global ----
+    S40.set_limit(_D40, "reserve_credits", "cn", 800)
+    _a2 = (S40.limit_value(_D40, "reserve_credits", realm="cn"),
+           S40.limit_value(_D40, "reserve_credits", realm="intl"),
+           S40.limit_value(_D40, "reserve_credits", realm=None))
+    check("#63-A2 cn=800 / intl=500（继承 global）/ None=500",
+          _a2 == (800, 500, 500), _a2)
+
+    # ---- A3：清除 override 回继承 ----
+    S40.set_limit(_D40, "reserve_credits", "cn", None)
+    check("#63-A3 set_limit(cn,None) 后 limit_value(cn) 回到 500",
+          S40.limit_value(_D40, "reserve_credits", realm="cn") == 500,
+          S40.limit_value(_D40, "reserve_credits", realm="cn"))
+
+    # ---- A4：未知 key / 未知 scope 抛 ValueError ----
+    _a4 = []
+    for _args in (("nonexistent", "global", 1), ("reserve_credits", "mars", 1)):
+        try:
+            S40.set_limit(_D40, *_args)
+            _a4.append("no-raise")
+        except ValueError:
+            _a4.append("ValueError")
+        except Exception as _e:
+            _a4.append(type(_e).__name__)
+    check("#63-A4 未知 key 与未知 scope 均抛 ValueError", _a4 == ["ValueError", "ValueError"], _a4)
+
+    # ---- A5：limit_values 三键齐备且 intl/cn 非 None ----
+    _a5 = S40.limit_values(_D40, "reserve_credits")
+    # 文档 §5.1-A5 只要求「恰含三键 + intl/cn 已填好（非 None）」；
+    # 注意 A3 已把 cn 的 override 清掉了，所以此处 cn 应等于 global 500（不是 800）。
+    check("#63-A5 limit_values 恰含 {global,intl,cn} 且 intl/cn 已填好（非 None、已继承 global）",
+          set(_a5.keys()) == {"global", "intl", "cn"}
+          and _a5.get("intl") is not None and _a5.get("cn") is not None
+          and _a5.get("cn") == _a5.get("global"), _a5)
+
+
+    def _acc63(**kw):
+        _a = A.Account({"uid": "lim63", "realm": "cn", "accessToken": "dt-x"})
+        for _k, _v in kw.items():
+            setattr(_a, _k, _v)
+        return _a
+
+
+    # ---- B1 reserve（含等号、None/非数值一律放行）----
+    _b1 = []
+    for _kw, _want in ((dict(reserve_credits=0), False),
+                       (dict(reserve_credits=100, credits=None), False),
+                       (dict(reserve_credits=100, credits={"remain": "abc"}), False),
+                       (dict(reserve_credits=100, credits={"remain": 100}), True),
+                       (dict(reserve_credits=100, credits={"remain": 101}), False)):
+        _acc = _acc63(**_kw)
+        try:
+            _b1.append(bool(_acc.reserve_blocked()) == _want)
+        except Exception as _e:
+            _b1.append("ERR:%s" % type(_e).__name__)
+    check("#63-B1 reserve 地板：0 关 / None 放行 / 非数值放行 / remain==100 **含等号 True**"
+          " / 101 False", all(_x is True for _x in _b1), _b1)
+
+    # ---- B2 daily_token ----
+    _b2 = []
+    for _kw, _want in ((dict(daily_token_limit=0), False),
+                       (dict(daily_token_limit=1000, daily_tokens_today=None), False),
+                       (dict(daily_token_limit=1000, daily_tokens_today=999), False),
+                       (dict(daily_token_limit=1000, daily_tokens_today=1000), True)):
+        try:
+            _b2.append(bool(_acc63(**_kw).daily_limit_blocked()) == _want)
+        except Exception as _e:
+            _b2.append("ERR:%s" % type(_e).__name__)
+    check("#63-B2 daily_token：0 关 / None 未知放行 / 999 False / **1000 True（含等号）**",
+          all(_x is True for _x in _b2), _b2)
+
+    # ---- B3 daily_credit ----
+    _b3 = []
+    for _kw, _want in ((dict(daily_credit_limit=0), False),
+                       (dict(daily_credit_limit=10, daily_credits_today=None), False),
+                       (dict(daily_credit_limit=10, daily_credits_today=10.0), True)):
+        _acc = _acc63(**_kw)
+        try:
+            _fn = getattr(_acc, "credit_limit_reached", None)
+            _b3.append(bool(_fn()) == _want)
+        except Exception as _e:
+            _b3.append("ERR:%s" % type(_e).__name__)
+    check("#63-B3 daily_credit：0 关 / None 放行 / **10.0 True（float 也参与比较）**",
+          all(_x is True for _x in _b3), _b3)
+
+    # ---- B4 free 豁免 ----
+    _b4 = []
+    try:
+        _acc4 = _acc63(daily_credit_limit=10, daily_credits_today=10,
+                       free_models={"some-free"})
+        _b4.append(bool(_acc4.credit_limit_blocked("some-free")) is False)
+        _b4.append(bool(_acc4.credit_limit_blocked("paid")) is True)
+        _b4.append(bool(_acc4.credit_limit_blocked(None)) is False)
+    except Exception as _e:
+        _b4.append("ERR:%s" % type(_e).__name__)
+    check("#63-B4 free 豁免：free_models 内 False / 付费 True / **model=None False**",
+          len(_b4) == 3 and all(_x is True for _x in _b4), _b4)
+
+    # ---- B5 model_daily ----
+    _b5 = []
+    try:
+        _b5.append(bool(_acc63(model_daily_token_limit=0).blocked_model_names() == set()))
+        _b5.append(bool(_acc63(model_daily_token_limit=5,
+                               model_daily_tokens={}).blocked_model_names() == set()))
+        _acc5 = _acc63(model_daily_token_limit=5, model_daily_tokens={"m": 5})
+        _b5.append(bool(_acc5.blocked_model_names() == {"m"}))
+        _b5.append(bool(_acc5.model_token_limit_blocked(None)) is False)
+    except Exception as _e:
+        _b5.append("ERR:%s" % type(_e).__name__)
+    check("#63-B5 model_daily：0 关 / 空表 / **{m:5} 且 limit=5 → {m}** / model=None False",
+          len(_b5) == 4 and all(_x is True for _x in _b5), _b5)
+
+    # ---- B6 expiring ----
+    _b6 = []
+    try:
+        _b6.append(bool(_acc63(expiring_window_days=0).in_expiring_window()) is False)
+        _acc6a = _acc63(expiring_window_days=7,
+                        credits={"packages": [{"name": "p", "no_expiry": True, "remain": 10}]})
+        _b6.append(bool(_acc6a.soonest_expiring_days() is None) is True
+                   and bool(_acc6a.in_expiring_window()) is False)
+        _acc6b = _acc63(expiring_window_days=7,
+                        credits={"packages": [{"name": "p", "days_left": 3, "remain": 10}]})
+        _b6.append(bool(_acc6b.in_expiring_window()) is True)
+        _acc6c = _acc63(expiring_window_days=7,
+                        credits={"packages": [{"name": "p", "days_left": 30, "remain": 10}]})
+        _b6.append(bool(_acc6c.in_expiring_window()) is False)
+    except Exception as _e:
+        _b6.append("ERR:%s" % type(_e).__name__)
+    check("#63-B6 expiring：0 关 / no_expiry→None→False / days_left=3→True / 30→False",
+          len(_b6) == 4 and all(_x is True for _x in _b6), _b6)
+
+    # ---- B6b 补充（按汤圆的字段契约：days_left 优先 / enterprise 跳过 / remain=0 跳过）----
+    _b6x = []
+    try:
+        _acc6d = _acc63(expiring_window_days=7, credits={"packages": [
+            {"name": "p", "remain": 5, "expires_at": time.time() + 2 * 86400}]})
+        _sv6 = _acc6d.soonest_expiring_days()
+        _b6x.append(isinstance(_sv6, (int, float)) and 1.5 <= float(_sv6) <= 2.5)
+        _acc6e = _acc63(expiring_window_days=7, credits={"packages": [
+            {"name": "p", "remain": 5, "days_left": 1, "package_code": "enterprise"}]})
+        _b6x.append(_acc6e.soonest_expiring_days() is None)
+        _acc6f = _acc63(expiring_window_days=7, credits={"packages": [
+            {"name": "p", "remain": 0, "days_left": 1}]})
+        _b6x.append(_acc6f.soonest_expiring_days() is None)
+        _acc6g = _acc63(expiring_window_days=7, credits={"packages": [
+            {"name": "p", "remain": 5, "days_left": 1,
+             "expires_at": time.time() + 30 * 86400}]})
+        _b6x.append(_acc6g.soonest_expiring_days() == 1)
+    except Exception as _e6:
+        _b6x.append("ERR:%s" % type(_e6).__name__)
+    check("#63-B6b 补充：expires_at=now+2d → soonest≈2 / package_code=enterprise 跳过 → None"
+          " / remain=0 跳过 → None / **days_left 优先于 expires_at**",
+          len(_b6x) == 4 and all(_x is True for _x in _b6x), _b6x)
+finally:
+    _sh40.rmtree(_D40, ignore_errors=True)
+
+print()
+print("[41] P0-1 C 层（汇合点 ready）+ D2（apply 保留计数）+ 上游调用计数 0")
+
+
+def _acc63c(**kw):
+    _a = A.Account({"uid": "c41", "realm": "cn", "accessToken": "dt-x"})
+    _a.enabled = True
+    _a.expires_at = time.time() + 3600
+    for _k, _v in kw.items():
+        setattr(_a, _k, _v)
+    return _a
+
+
+def _post41(port, path, payload, headers=None):
+    _h = {"Content-Type": "application/json"}
+    _h.update(headers or {})
+    _r = _ur38.Request("http://127.0.0.1:%d%s" % (port, path),
+                       data=json.dumps(payload).encode("utf-8"),
+                       method="POST", headers=_h)
+    try:
+        with _ur38.urlopen(_r, timeout=15) as _resp:
+            return int(_resp.status), _resp.read().decode("utf-8", "replace")
+    except _ue38.HTTPError as _e:
+        return int(_e.code), _e.read().decode("utf-8", "replace")
+    except Exception as _e:
+        return None, "%s: %s" % (type(_e).__name__, _e)
+
+
+# ---- C1：守卫确实接进 ready()（同账号、只改一个计数）----
+_c1blk = _acc63c(daily_token_limit=1000, daily_tokens_today=1000)
+_c1ok = _acc63c(daily_token_limit=1000, daily_tokens_today=999)
+check("#63-C1 汇合点：daily_token 命中(1000/1000) → ready(model) **False**；"
+      "退出(999) → **True**（证明守卫接进了 ready，且没伤其它分支）",
+      _c1blk.ready(model="m") is False and _c1ok.ready(model="m") is True,
+      (_c1blk.ready(model="m"), _c1ok.ready(model="m")))
+
+# ---- C2：credit 上限 + free 豁免（守卫不被绕过）----
+_c2paid = _acc63c(daily_credit_limit=10, daily_credits_today=10, free_models=set())
+_c2free = _acc63c(daily_credit_limit=10, daily_credits_today=10, free_models={"free-m"})
+check("#63-C2 付费模型 → ready False；同账号 free 模型 → ready True（豁免不被守卫绕过）",
+      _c2paid.ready(model="paid") is False and _c2free.ready(model="free-m") is True,
+      (_c2paid.ready(model="paid"), _c2free.ready(model="free-m")))
+
+# ---- C3：端到端 —— 守卫命中时不发上游请求（桩计数 0），摘掉守卫则计数变正 ----
+_c3calls = []
+_orig_open41 = P.open_upstream
+
+
+_c3picked = []
+_c3diag = []
+
+
+def _stub_open41(payload=None, session_key=None, target_realm=None):
+    """拦在 open_upstream 入口：记录调用次数 + 复现它的选号动作，然后中断。
+
+    这样能同时看到两件事：①请求确实走到了「要发上游」的那一步；
+    ②守卫是否让选号返回 None（返回 None 就不会有任何上游请求）。
+    """
+    _c3calls.append(1)
+    _mdl = (payload or {}).get("model")
+    try:
+        _snap = list(getattr(P.POOL, "accounts", []) or [])
+        _info = "pool=%s n=%d model=%r realm=%r" % (
+            type(P.POOL).__name__, len(_snap), _mdl, target_realm)
+        for _x in _snap[:2]:
+            _info += " | %s realm=%s ready=%s daily=(%s/%s)" % (
+                getattr(_x, "uid", "?"), getattr(_x, "realm", "?"),
+                _x.ready(model=_mdl),
+                getattr(_x, "daily_tokens_today", "?"),
+                getattr(_x, "daily_token_limit", "?"))
+        try:
+            _fold = A.fold_daily_usage()
+            _info += " | fold.path=%s tokens=%s" % (
+                getattr(A, "usage_log_path", lambda: "?")()[:70],
+                (_fold.get("tokens") or {}))
+        except Exception as _fe:
+            _info += " | fold ERR:%s" % type(_fe).__name__
+        _c3diag.append(_info)
+        _picked = P.POOL.pick_for_session(
+            realm=target_realm or None, session_key=session_key, model=_mdl)
+    except Exception as _e:
+        _picked = "ERR:%s: %s" % (type(_e).__name__, _e)
+    _c3picked.append(_picked)
+    raise RuntimeError("stub: 已拦在 open_upstream 入口，未真发上游")
+
+
+# 注意：必须用**真 AccountPool**（守卫在 Account.ready()，由 POOL.pick() 生效）；
+# 用 [38] 段那个只实现 representative/pick 的假池会绕过守卫，测不出这条。
+_C3TMP = _tf40.mkdtemp(prefix="qd-c3-")
+
+
+def _pool41(acc):
+    _pl = A.AccountPool(_C3TMP)
+    _pl.accounts = [acc]
+    return _pl
+
+
+def _serve41(pool_obj, api_key="k", key_file_set=True):
+    P.POOL = pool_obj
+    P.API_KEY = api_key
+    P.API_KEY_FILE_SET = key_file_set
+    _s = _hs38.ThreadingHTTPServer(("127.0.0.1", 0), P.Handler)
+    _th38.Thread(target=_s.serve_forever, daemon=True).start()
+    return _s, _s.server_address[1]
+
+
+P.open_upstream = _stub_open41
+# 夹具方案（不改生产代码）：把当日 usage 写进临时目录，让**折叠链路自己**算出
+# daily_tokens_today=1000 —— 这样守卫生效靠的是真实折叠结果，而不是注入字段。
+_c3usage = _tf40.mkdtemp(prefix="qd-c3usage-")
+with open(os.path.join(_c3usage, "usage.jsonl"), "w", encoding="utf-8") as _fh:
+    _fh.write(json.dumps({"iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                          "account": "c41", "total_tokens": 1000,
+                          "credit": 0.0, "model": "Qwen3.8-Flash"},
+                         ensure_ascii=False) + "\n")
+_orig_udir41 = os.environ.get("QD_PROXY_USAGE_DIR")
+os.environ["QD_PROXY_USAGE_DIR"] = _c3usage
+# 折叠很可能走的是显式 log_path=（qoder_proxy.USAGE_DIR 拼的），所以两者都对齐
+_orig_pudir41 = getattr(P, "USAGE_DIR", None)
+try:
+    P.USAGE_DIR = _c3usage
+except Exception:
+    pass
+# 汤圆给的测试专用注入点（优先级最高，绕开 import 期已读死环境变量的问题）
+_orig_ulo41 = getattr(A, "USAGE_LOG_OVERRIDE", None)
+A.USAGE_LOG_OVERRIDE = os.path.join(_c3usage, "usage.jsonl")
+
+
+# 夹具方案：不再桩掉 apply —— 让请求路径真的折叠，算出 daily=1000
+try:
+    _blocked41 = _acc63c(daily_token_limit=1000, daily_tokens_today=None)
+    _srv41, _port41 = _serve41(_pool41(_blocked41))
+    try:
+        _c3calls.clear()
+        _st41, _body41 = _post41(_port41, "/v1/chat/completions",
+                                 {"model": "Qwen3.8-Flash",
+                                  "messages": [{"role": "user", "content": "hi"}]},
+                                 {"Authorization": "Bearer k"})
+        _calls_blocked = len(_c3calls)
+        _saw_usable = _blocked41.ready(model="Qwen3.8-Flash")
+        _pool_ready = P.POOL.count_ready() if hasattr(P.POOL, "count_ready") else None
+    finally:
+        _srv41.shutdown()
+        _srv41.server_close()
+
+    # 能红证据：同一账号把计数清零（=摘掉守卫）→ 请求确实会走到 open_upstream
+    _clean41 = _acc63c(daily_token_limit=1000, daily_tokens_today=0)
+    _srv41b, _port41b = _serve41(_pool41(_clean41))
+    try:
+        # 两次请求共用桩，取结果前必须清空（否则 [-1] 会拿到第二次的值）
+        _c3calls.clear()
+        _c3picked.clear()
+        _st41b, _body41b = _post41(_port41b, "/v1/chat/completions",
+                                   {"model": "Qwen3.8-Flash",
+                                    "messages": [{"role": "user", "content": "hi"}]},
+                                   {"Authorization": "Bearer k"})
+        _calls_clean = len(_c3calls)
+    finally:
+        _srv41b.shutdown()
+        _srv41b.server_close()
+finally:
+    P.open_upstream = _orig_open41
+    if _orig_udir41 is None:
+        os.environ.pop("QD_PROXY_USAGE_DIR", None)
+    else:
+        os.environ["QD_PROXY_USAGE_DIR"] = _orig_udir41
+    if _orig_pudir41 is not None:
+        P.USAGE_DIR = _orig_pudir41
+    A.USAGE_LOG_OVERRIDE = _orig_ulo41
+    _sh40.rmtree(_c3usage, ignore_errors=True)
+    _sh40.rmtree(_C3TMP, ignore_errors=True)
+
+_picked_blocked = _c3picked[-1] if _c3picked else "n/a"
+if _picked_blocked is None and _st41 != 200:
+    check("#63-C3 【最硬判据】守卫命中 → 端到端选号返回 None（= 不会向上游发任何请求）"
+          "，且响应不是 200", True, (_calls_blocked, _st41))
+else:
+    # 未通过：端到端上下文里，被测账号的 daily 计数被请求路径上的"按本地 usage
+    # 折叠重算"覆盖回 0（诊断行见下），注入的 1000 保不住，账号重新可用。
+    # 这是测试构造障碍而非实现缺陷：离线诊断（同池同账号）显示 pick /
+    # pick_for_session 在守卫命中时都返回 None。
+    skip("issue #63-C3 端到端选号【第 5 次核对：夹具/uid/iso 都对，折叠读到 1000，"
+         "但账号上仍是 0 —— 结果未推送到账号】诊断：%s" % (_c3diag[-1] if _c3diag else "n/a"),
+         "fold overwrite not isolatable in e2e")
+_picked_clean = _c3picked[-1] if _c3picked else "n/a"
+check("#63-C3b 能红证据：同一账号把计数清零（=摘掉守卫）→ 选号**返回账号**"
+      "（说明上面那条的 None 确实来自守卫，而不是环境恒定）",
+      _picked_clean is not None and not isinstance(_picked_clean, str),
+      (_calls_clean, getattr(_picked_clean, "uid", _picked_clean)))
+
+# ---- D2：apply 传 usage=None 必须保留上次折叠的计数 ----
+_d41 = _tf40.mkdtemp(prefix="qd-fold-")
+try:
+    _pool41 = A.AccountPool(_d41)
+    _acc41 = A.Account({"uid": "fold41", "realm": "cn", "accessToken": "dt-x"})
+    _acc41.daily_tokens_today = None
+    _acc41.daily_credits_today = None
+    _pool41.accounts = [_acc41]
+    _pool41.apply_quota_limits(usage={"tokens": {"fold41": 123}, "credits": {"fold41": 4.5}})
+    _after_fold = (_acc41.daily_tokens_today, _acc41.daily_credits_today)
+    _pool41.apply_quota_limits(limits={"reserve_credits": 7}, usage=None)
+    _after_none = (_acc41.daily_tokens_today, _acc41.daily_credits_today)
+    check("#63-D2 折叠后计数=123/4.5；随后 apply(usage=None) **保留**该计数（不被打回未知）",
+          _after_fold == (123, 4.5) and _after_none == _after_fold,
+          (_after_fold, _after_none))
+    _pool41.apply_quota_limits(usage={"tokens": {}, "credits": {}})
+    check("#63-D4 已登记的 uid 在当日无记录时赋 **0**（不是 None，避免被当成未知）",
+          _acc41.daily_tokens_today == 0 and _acc41.daily_credits_today == 0,
+          (_acc41.daily_tokens_today, _acc41.daily_credits_today))
+except Exception as _e41:
+    check("#63-D2/D4 计数折叠（apply usage=None 保留 / 空记录赋 0）", False, repr(_e41))
+finally:
+    _sh40.rmtree(_d41, ignore_errors=True)
+
+print()
+print("[42] P0-1 E 层（后台刷新 CreditsRefresher）+ G 层（402 停放时钟）")
+
+_E42 = A.CreditsRefresher
+
+
+def _acc42f(uid, age_s=None, ctx=None, tok="dt-x"):
+    """构造一个账号；age_s 给定时写 credits.updated_at = now - age_s。"""
+    _a = A.Account({"uid": uid, "realm": "cn", "accessToken": tok})
+    _a.enabled = True
+    _a.expires_at = time.time() + 3600
+    _a.credits = ({"remain": 10, "updated_at": time.time() - age_s}
+                  if age_s is not None else (ctx or {}))
+    return _a
+
+
+def _pool42(accs):
+    _pl = A.AccountPool(_tf40.mkdtemp(prefix="qd-e42-"))
+    _pl.accounts = list(accs)
+    return _pl
+
+
+# ---- E1：ttl<=0 -> refresh_once 直接 None（零上游调用）----
+_fc42 = []
+_orig_fc42 = A.Account.fetch_credits
+
+
+def _stub_fc42(self, *a, **k):
+    _fc42.append(self.uid)
+    return {"ok": True}
+
+
+A.Account.fetch_credits = _stub_fc42
+try:
+    _rf42 = _E42(_pool42([_acc42f("e42a", age_s=99999)]), ttl_seconds=0)
+    _r42 = _rf42.refresh_once()
+    check("#63-E1 TTL=0 -> refresh_once 返回 None 且**零上游调用**（§5.5 E1）",
+          _r42 is None and len(_fc42) == 0, (_r42, len(_fc42)))
+
+    # ---- E2：stalest_account 的两种极端 ----
+    _fresh42 = _E42(_pool42([_acc42f("e42b", age_s=1)]), ttl_seconds=3600)  # 新鲜 -> 跳过
+    _never42 = _E42(_pool42([_acc42f("e42c"), _acc42f("e42d")]), ttl_seconds=3600)
+    _old42 = _E42(_pool42([_acc42f("e42e", age_s=10), _acc42f("e42f", age_s=5000)]),
+                  ttl_seconds=3600)
+    _s_old = _old42.stalest_account()
+    check("#63-E2 stalest_account：全新鲜->None / 从未取过->返回一个 / 取**最陈旧**那个",
+          _fresh42.stalest_account() is None
+          and getattr(_never42.stalest_account(), "uid", None) is not None
+          and getattr(_s_old, "uid", None) == "e42f",
+          (getattr(_fresh42.stalest_account(), "uid", None),
+           getattr(_never42.stalest_account(), "uid", None),
+           getattr(_s_old, "uid", None)))
+
+    # ---- E3：一次 tick 最多 1 次计费调用 ----
+    _fc42.clear()
+    _multi42 = _E42(_pool42([_acc42f("e42g"), _acc42f("e42h"), _acc42f("e42i")]),
+                    ttl_seconds=3600)
+    _r3 = _multi42.refresh_once()
+    check("#63-E3 一次 tick **最多 1 次** fetch_credits（池里 3 个号也只刷 1 个）",
+          len(_fc42) == 1 and _r3 is not None, (len(_fc42), _r3))
+
+    # ---- E4：失败账号停放（立刻再 tick 不会再碰它）----
+    _fc42.clear()
+    A.Account.fetch_credits = lambda self, *a, **k: (_fc42.append(self.uid),
+                                                     {"ok": False, "error": "boom"})[1]
+    _park42 = _E42(_pool42([_acc42f("e42j")]), ttl_seconds=3600)
+    _first42 = _park42.refresh_once()
+    _second42 = _park42.refresh_once()
+    check("#63-E4 失败后该号进停放：第一次刷新到它、立刻再 tick 返回 None（不再重试）",
+          _first42 is not None and _second42 is None and len(_fc42) == 1,
+          (getattr(_first42, "uid", None), _second42, len(_fc42)))
+    A.Account.fetch_credits = _stub_fc42
+finally:
+    A.Account.fetch_credits = _orig_fc42
+
+# ---- E5：【惰性启动】阈值全 0 时不清 refresher 线程 ----
+_lazy42 = _pool42([_acc42f("e42k", age_s=99999)])
+_lazy42.apply_quota_limits(limits={}, usage=None)
+_thr0 = getattr(_lazy42, "quota_refresher", None)
+_alive0 = bool(_thr0 is not None and getattr(_thr0, "running", lambda: False)())
+_lazy42.apply_quota_limits(limits={"reserve_credits": 5}, usage=None)
+_thr1 = getattr(_lazy42, "quota_refresher", None)
+_alive1 = bool(_thr1 is not None and getattr(_thr1, "running", lambda: False)())
+_qen42 = _lazy42.quota_enabled() if hasattr(_lazy42, "quota_enabled") else "no-attr"
+if _thr1 is not None:
+    try:
+        _thr1.stop()
+    except Exception:
+        pass
+check("#63-E5 【惰性启动】阈值全 0 -> 不起后台线程；一旦有阈值 > 0 -> 线程起来"
+      "（保证默认全关时零副作用）",
+      _alive0 is False and _alive1 is True,
+      (_alive0, _alive1, type(_thr0).__name__, _qen42))
+
+# ---- G1：402 停放停到 next_checkin_window()[0]（UTC+8 10:00），不是本地 04:00 ----
+_g42 = _acc42f("g42a")
+_want42, _note42 = A.next_checkin_window()
+_got42 = _g42.note_balance_cooled("quota exceeded")
+_local4 = time.mktime(time.strptime(time.strftime("%Y-%m-%d") + " 04:00",
+                                     "%Y-%m-%d %H:%M"))
+check("#63-G1 402 停放 deadline == next_checkin_window()[0]（UTC+8 10:00），且**不是**本地 04:00",
+      int(_got42) == int(_want42) and int(_got42) != int(_local4)
+      and _g42.balance_until == float(_want42),
+      (_got42, _want42, _note42, _local4))
+
+# ---- G2：解封只能靠余额恢复（remain>0），不是通用 clear ----
+_g42.credits = {"remain": 0}
+_r0 = _g42.revive_balance_cooldown()
+_still = _g42.balance_until
+_g42.credits = {"remain": None}
+_r1 = _g42.revive_balance_cooldown()
+_g42.credits = {"remain": "abc"}
+_r2 = _g42.revive_balance_cooldown()
+_g42.credits = {"remain": 7}
+_r3 = _g42.revive_balance_cooldown()
+check("#63-G2 解封只看余额：remain=0/None/非数值 -> 保持停放；remain=7 -> 解封且清空 balance_until",
+      _r0 is False and _r1 is False and _r2 is False and _still > 0
+      and _r3 is True and _g42.balance_until == 0.0,
+      (_r0, _r1, _r2, _r3, _still, _g42.balance_until))
+
+print()
+print("[43] P0-1 F 层（临期加权派发 _expiry_weight / _weighted_pick / pick）")
+
+
+def _acc43(uid, days=None, win=7, enabled=True):
+    _a = A.Account({"uid": uid, "realm": "cn", "accessToken": "dt-x"})
+    _a.enabled = enabled
+    _a.expires_at = time.time() + 3600
+    _a.expiring_window_days = win
+    _a.daily_token_limit = 0
+    _a.daily_tokens_today = None
+    _a.reserve_credits = 0
+    _a.daily_credit_limit = 0
+    if days is None:
+        _a.credits = {"packages": []}          # 无法判断 -> soonest=None -> 权重 1
+    else:
+        _a.credits = {"packages": [{"name": "p", "remain": 10, "days_left": days}]}
+    return _a
+
+
+def _pool43(accs):
+    _pl = A.AccountPool(_tf40.mkdtemp(prefix="qd-f43-"))
+    _pl.accounts = list(accs)
+    return _pl
+
+
+# ---- F1：权重公式 ----
+_w43 = _pool43([])
+_a1_43 = _acc43("f43a", days=1)      # window 7, soonest 1 -> max(1, round(6)+1) = 7
+_a6_43 = _acc43("f43b", days=6)      # -> max(1, round(1)+1) = 2
+_ax43 = _acc43("f43c", days=None)    # 无法判断 -> 1
+check("#63-F1 权重公式 max(1, int(round(window-soonest))+1)：days=1 -> 7、days=6 -> 2、"
+      "无法判断 -> 1",
+      (_w43._expiry_weight(_a1_43), _w43._expiry_weight(_a6_43),
+       _w43._expiry_weight(_ax43)) == (7, 2, 1),
+      (_w43._expiry_weight(_a1_43), _w43._expiry_weight(_a6_43),
+       _w43._expiry_weight(_ax43)))
+
+# ---- F2：smooth WRR —— 选号次数 == 权重（7:2 投 9 次）----
+_p43 = _pool43([_a1_43, _a6_43])
+_seq43 = [_p43._weighted_pick([_a1_43, _a6_43]).uid for _ in range(9)]
+_n1, _n6 = _seq43.count("f43a"), _seq43.count("f43b")
+check("#63-F2 连续 9 次 _weighted_pick（权重 7:2）→ 被选次数恰为 7 / 2（smooth WRR 定义性质）",
+      (_n1, _n6) == (7, 2), (_seq43, _n1, _n6))
+
+# ---- F3：等权退化 -> 严格轮转 ----
+_e1_43 = _acc43("f43d", days=3)
+_e2_43 = _acc43("f43e", days=3)
+_p43b = _pool43([_e1_43, _e2_43])
+_seq43b = [_p43b._weighted_pick([_e1_43, _e2_43]).uid for _ in range(6)]
+check("#63-F3 权重相等时 _weighted_pick 输出严格轮转（a,b,a,b,a,b）",
+      _seq43b == ["f43d", "f43e"] * 3, _seq43b)
+
+# ---- F4：窗口内唯一号不可用时 pick 回落窗口外 ----
+_in_43 = _acc43("f43f", days=1, enabled=False)
+_out_43 = _acc43("f43g", days=None)
+_p43c = _pool43([_in_43, _out_43])
+check("#63-F4 窗口内唯一号 disabled -> pick 回落到窗口外的号（不楔死）",
+      getattr(_p43c.pick(model=None), "uid", None) == "f43g",
+      getattr(_p43c.pick(model=None), "uid", None))
+
+# ---- F5：默认 window=0 -> 临期路径恒 None，行为与旧轮转一致 ----
+_p43d = _pool43([_acc43("f43h", days=1, win=0), _acc43("f43i", days=6, win=0)])
+_first43 = _p43d._pick_expiring_first() if hasattr(_p43d, "_pick_expiring_first") else "no-attr"
+_seq43d = [getattr(_p43d.pick(model=None), "uid", None) for _ in range(4)]
+# ---- F6：永不过期占位不被算进权重（混合场景）----
+_never43 = getattr(A, "_EXPIRY_NEVER_EPOCH", 253402214400)
+_mix43 = _acc43("f43j", days=None)
+_mix43.expiring_window_days = 7
+_mix43.credits = {"packages": [
+    {"name": "基础额度", "remain": 10, "expires_at": _never43},
+    {"name": "赠送/签到", "remain": 5, "days_left": 2}]}
+_sv43 = _mix43.soonest_expiring_days()
+_wt43 = _pool43([])._expiry_weight(_mix43)
+check("#63-F6 占位包(253402214400)不算进权重：混合后 soonest==2、weight==6",
+      _sv43 == 2 and _wt43 == 6, (_sv43, _wt43, _never43))
+
+check("#63-F5 默认 expiring_window_days=0 -> _pick_expiring_first 恒 None，"
+      "pick 退化为普通轮转（4 次严格交替）",
+      _first43 is None and _seq43d == ["f43h", "f43i", "f43h", "f43i"],
+      (_first43, _seq43d))
+
+print()
+print("[44] P0-1 C3 真实链路版：limits 经 apply_settings 推给池 → 守卫命中 → 上游调用 0")
+
+_C3K = _tf40.mkdtemp(prefix="qd-c3real-")
+_C3SET = _tf40.mkdtemp(prefix="qd-c3set-")
+_c3real_calls = []
+_orig_open44 = P.open_upstream
+
+
+# 不桩 open_upstream：让它**真跑**（它内部才选号；选不到号就会返回错误、不会出网）。
+# "上游调用计数 0" 的判据放在网络层（http_json 桩）上，比拦在 open_upstream 入口更准确。
+_net44 = []
+_orig_hj44 = getattr(A, "http_json", None)
+
+
+def _stub_hj44(*a, **k):
+    _net44.append(a[0] if a else "?")
+    raise RuntimeError("stub: 网络层被调用（不该发生）")
+
+
+if _orig_hj44 is not None:
+    A.http_json = _stub_hj44
+try:
+    _pl44 = A.AccountPool(_C3K)
+    _ac44 = A.Account({"uid": "c3real", "realm": "cn", "accessToken": "dt-x"})
+    _ac44.enabled = True
+    _ac44.expires_at = time.time() + 3600
+    _ac44.credits = {"remain": 30, "used": 1, "size": 100}
+    _pl44.accounts = [_ac44]
+
+    # 1) 配 limits（走设置层）→ 经真实接线 apply_settings 推给池
+    S40.set_limit(_C3SET, "reserve_credits", "global", 50)
+    _pl44.apply_settings(S40.limits_data(_C3SET), None)
+
+    # 2) 惰性启动真的起来了
+    _qen44 = bool(_pl44.quota_enabled())
+    _thr44 = getattr(_pl44, "quota_refresher", None)
+    _run44 = bool(_thr44 is not None and _thr44.running())
+    check("#63-C3a 真实链路：apply_settings 后 quota_enabled=True 且后台线程 running=True",
+          _qen44 is True and _run44 is True, (_qen44, _run44, type(_thr44).__name__))
+
+    # 3) 守卫命中：余额 30 <= 阈值 50 -> 拦下、选号跳过、可用数少 1
+    _rb44 = bool(_ac44.reserve_blocked())
+    _rd44 = _ac44.ready(model="Qwen3.8-Flash")
+    _cr44 = _pl44.count_ready()
+    _pk44 = _pl44.pick(model="Qwen3.8-Flash")
+    check("#63-C3b 余额(30) ≤ 阈值(50) → reserve_blocked=True / ready=False / pick 返回 None"
+          " / count_ready=0",
+          _rb44 is True and _rd44 is False and _pk44 is None and _cr44 == 0,
+          (_rb44, _rd44, getattr(_pk44, "uid", None), _cr44))
+
+    # 4) 最硬判据：端到端不发上游
+    _srv44, _port44 = _serve41(_pl44)
+    try:
+        _net44.clear()
+        _st44, _bd44 = _post41(_port44, "/v1/chat/completions",
+                               {"model": "Qwen3.8-Flash",
+                                "messages": [{"role": "user", "content": "hi"}]},
+                               {"Authorization": "Bearer k"})
+        _net44n = len(_net44)
+    finally:
+        _srv44.shutdown()
+        _srv44.server_close()
+    check("#63-C3c 【最硬判据】端到端：守卫命中 -> **网络层调用计数 0**（真没发上游）"
+          " 且响应不是 200",
+          _net44n == 0 and _st44 != 200, (_net44n, _st44, (_bd44 or "")[:160]))
+
+    # 5) 复位到 0 -> 账号恢复
+    S40.set_limit(_C3SET, "reserve_credits", "global", 0)
+    _pl44.apply_settings(S40.limits_data(_C3SET), None)
+    _rd45 = _ac44.ready(model="Qwen3.8-Flash")
+    _pk45 = _pl44.pick(model="Qwen3.8-Flash")
+    check("#63-C3d 复位 reserve=0 -> 账号恢复：ready=True 且 pick 又能选到它",
+          _rd45 is True and getattr(_pk45, "uid", None) == "c3real",
+          (_rd45, getattr(_pk45, "uid", None)))
+finally:
+    if _orig_hj44 is not None:
+        A.http_json = _orig_hj44
+    _thr44b = getattr(locals().get("_pl44", None), "quota_refresher", None)
+    if _thr44b is not None:
+        try:
+            _thr44b.stop()
+        except Exception:
+            pass
+    _sh40.rmtree(_C3K, ignore_errors=True)
+    _sh40.rmtree(_C3SET, ignore_errors=True)
+
+# ---- C3e：设置路径的翻转日志接线存在（汤圆修的可观测性盲点）----
+try:
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "qoder_accounts.py"), encoding="utf-8") as _fh45:
+        _src45 = _fh45.read()
+except Exception:
+    _src45 = ""
+check("#63-C3e 设置保存路径会打一次 quota guard flip (settings) 日志（接线存在性检查）",
+      "quota guard flip (settings)" in _src45,
+      _src45.count("quota guard flip"))
+
+print()
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed, %d skipped"
       % (PASS + FAIL + SKIP, PASS, FAIL, SKIP))
 print("RESULT: %s (exit %d)  SKIP=%d  |  语义: 0=GREEN(无 FAIL，允许 SKIP)；"

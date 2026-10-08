@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.19-2496ED?style=flat-square" alt="Version 1.2.19">
+  <img src="https://img.shields.io/badge/Release-v1.3.0-2496ED?style=flat-square" alt="Version 1.3.0">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -433,6 +433,41 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.0
+
+> **自 v1.2.12 以来的主要变更概览**：机器身份落盘缓存 + 种子机制修正（容器重建不再换设备）、VM 抖动多数表决（不把身份固定在少数派）、工具历史结构化直传、只读积分路由 `GET /credits/summary`、usage credit 统计修复 —— 以及本版两项：**事实性限额护栏**与**用量区间 / 时间序列**。
+
+**✨ 新增功能**
+
+**① 事实性限额护栏** —— 账号级预算闸门：**用尽自动换号**，而不是等上游返 402/429。
+- 四条护栏：**余额地板**（`reserve_credits`）· **当日 token**（`daily_token_limit`）· **当日 credit**（`daily_credit_limit`）· **单模型当日 token**（`model_daily_token_limit`）；
+- **三层作用域**（global + realm 两级）：**留空 = 继承**、**显式 0 = 关闭**；
+- **后台余额刷新**：每 tick 最多刷一个最陈旧账号（30min tick + 12h TTL），**惰性启动**（阈值全 0 时线程根本不存在，零副作用）；
+- **计数来自本地 usage 折叠** —— 不新增任何上游调用；
+- **402 / 额度停放**：停到 **UTC+8 每日 10:00**（qoder 自己的重置窗口，非通用 4am），**仅余额恢复**可提前解封；
+- **临期积分优先分派**：7 天内到期的额度优先消耗（smooth weighted round-robin），默认窗口 0（关）；
+- **面板**：设置页限额表格（带**量纲提示**）+ 账号行**四态徽标**（未启用 / 未知 / 已暂停 / 正常）。
+
+**② 用量区间与时间序列**：`/usage/analytics` · `/usage/by-account` · `/usage/perf` 支持 `?range=day|week|month|all|custom&since=&until=`；新增 **`/usage/timeseries`**；`realm=all` 现在是真正的通配符（此前 `/usage/perf` 采样恒为 0）。
+
+**🐛 问题修复**
+- **限额设置此前不会生效**（接线缺口）：**没有任何生产代码**把 limits 推给账号池 —— 配置写进 `settings.json` 就停住了，阈值恒 0、守卫永不触发。现在**启动时**与**设置保存后**各推一次（free 名单同批推送，避免空集拦住全部模型）；
+- **后台刷新线程此前会静默死掉**：`AccountPool.log` 默认实现只接受一个位置参数，而刷新线程传了 `level=` → 一 tick 就 `TypeError` 退出，整条刷新链路失效；
+- 设置页改阈值现在会打印状态翻转日志（此前只有其它路径打）。
+
+**🎨 体验优化**：面板两处（限额表格的量纲提示、账号护栏四态徽标）—— 见上 ① 末条。
+
+**⚠️ 其他变更**
+- ⚠️ **量纲说明（重要）**：qoder 的 credits 是**积分点数**（实测账号区间 **0~1100**），**不是 token 量级** —— 照 token 量级填阈值会**永远拦不到任何账号**；
+- **默认全部关闭（0）** —— 不给任何非零默认值；
+- 参考材料：本仓 `.team/_gap/`（双向差距分析 6 份文档 + 实测证据）。
+
+**验证**
+- 全量 **693 checks / 0 failed**；
+- **端到端（真实链路，非桩）**：配置 → `quota_enabled=True` → **后台线程启动** → 守卫命中 → `pick` 返回 None → **网络层调用计数 0**（确实没发上游）→ 复位后账号恢复；
+- 配置层 A1-A5 · 守卫层 B1-B6 · 汇合点 C1-C3 · 折叠 D2-D4 · 后台刷新 E1-E5（含惰性启动）· 派发偏好 F1-F6（含「默认关时与改动前等价」「永不过期占位不参与权重」两条边界）· 停放时钟 G1-G2 **全部通过**；
+- **一条流程留痕**：这条端到端判据前五轮不闭环，根因是**实现侧接线缺失 + 测试侧判据位置错误**各占一半 —— 判据应拦在**网络层**（是否真的出网），而不是「`open_upstream` 是否被调用」（网关正常路径本来就会进它、由它内部选号）。
 
 ### v1.2.19
 
