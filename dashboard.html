@@ -554,6 +554,10 @@ a:hover{text-decoration:underline}
         <div style="font-size:12px;color:var(--dim)" id="keyMatrixRange">时间窗口：—</div>
       </div>
       <div id="keyMatrix" style="overflow-x:auto"></div>
+      <div style="margin-top:16px">
+        <div style="font-size:13px;font-weight:600;color:var(--fg);margin-bottom:6px">各 Key 的档位分布（P1-3 审计 · 基于最近请求样本）</div>
+        <div id="effortByKey"></div>
+      </div>
       <div class="legend" style="margin-top:10px">
         <span><b>历史行未记录 Key</b>：P1-3 字段上线前的行（或未带 Key 的面板会话/未鉴权请求）日志里没有 key_id，
           后端把它们合并成一个桶，<b>不会丢弃</b></span>
@@ -2449,7 +2453,7 @@ function keyDisplay(id){
   const raw = (typeof id === 'string') ? id : '';
   if(!raw || raw === KEY_NO_KEY_ID){
     return { label: '历史行未记录 Key', sub: '', cls: 'badge off',
-             title: '这批行没有 key_id：P1-3 字段上线前的历史行，或未带 Key 的面板会话 / 未鉴权请求；后端归入 (no-key) 桶，不会被丢弃' };
+             title: '这批行没有 key_id：P1-3 字段上线前的历史行，或未带 Key 的面板会话 / 未鉴权请求；后端把它们合并成一个「无 Key」桶，不会被丢弃' };
   }
   if(KEY_ID_LABELS[raw]){
     return { label: KEY_ID_LABELS[raw], sub: esc(raw), cls: 'badge off',
@@ -2669,6 +2673,7 @@ async function refreshInner(){
   }
 
   const rows = recent.rows || [];
+  RECENT_SNAPSHOT = { page: RECENT_PAGE, limit: RECENT_LIMIT, total: total, rows: rows };   // 档位分布的样本（口径见 renderEffortByKey）
   const countEl = document.getElementById('recentCount');
   if(countEl) countEl.textContent = '(第 ' + RECENT_PAGE + ' 页 / 共 ' + fmt(total) + ' 条)';
   document.getElementById('recent').innerHTML = rows.length ?
@@ -2690,6 +2695,7 @@ async function refreshInner(){
         + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
+  renderEffortByKey();   // 样本变了就重算档位分布
 }
 
 (async function initDashboard(){
@@ -3687,6 +3693,8 @@ function setAnalyticsRange(range){
 // 面板开关 → 服务端 range：day = 本地零点起（qoder_proxy.range_window 的语义），all = 无窗口。
 const BYKEY_RANGE = r => (r === 'today' ? 'day' : 'all');
 let cachedByKey = null;
+// 最近请求表当前页的原始行（档位分布的样本来源）。**非全量**——与 by-key 聚合是两个口径。
+let RECENT_SNAPSHOT = null;
 
 // 按 API Key 聚合窗口数据。**不做客户端聚合**：打 /usage/by-key（与 /usage/by-account
 // 同源同窗口同缓存），因此同一 range 下两边合计必然相等。
@@ -3696,6 +3704,7 @@ async function loadByKey(){
     const data = await getJSON('/usage/by-key?range=' + encodeURIComponent(BYKEY_RANGE(analyticsRange)));
     cachedByKey = data;
     renderByKey(data);
+    renderEffortByKey();   // 档位分布跟着最近请求样本走（两处数据源独立，各自刷新）
   } catch(err) {
     if(box) box.innerHTML = '<div class="empty">按 Key 用量读取失败：' + esc(err.message) + '</div>';
     console.error('loadByKey failed:', err);
@@ -3756,6 +3765,62 @@ function renderByKey(data){
           + '</tr>';
       }).join('')
     + '</tbody></table>';
+}
+
+// 按 key 汇总档位分布：数据源是**最近请求表当前页的原始行**，不是 by-key 全量聚合，
+// 所以界面必须写明「基于最近 N 条」——否则数字与上方矩阵对不上会被误认为 bug。
+// 四类判定与 effortCell 完全同源：同值=原样透传 / 不同=被挪档 / 实际空串=被丢弃 / 键缺失=未请求。
+function effortStatsByKey(rows){
+  const buckets = {};
+  (rows || []).forEach(r => {
+    const id = (typeof r.key_id === 'string' && r.key_id) ? r.key_id : KEY_NO_KEY_ID;
+    const b = buckets[id] || (buckets[id] = { key_id: id, total: 0, same: 0, shifted: 0, dropped: 0, none: 0 });
+    b.total++;
+    const hasReq = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort_requested');
+    const hasEff = Object.prototype.hasOwnProperty.call(r, 'reasoning_effort');
+    const req = hasReq ? String(r.reasoning_effort_requested || '') : '';
+    const eff = hasEff ? String(r.reasoning_effort || '') : '';
+    if(hasEff && eff === '') b.dropped++;
+    else if(!hasReq) b.none++;
+    else if(eff === req) b.same++;
+    else b.shifted++;
+  });
+  return Object.keys(buckets).map(k => buckets[k]).sort((a, b) => b.total - a.total);
+}
+
+function renderEffortByKey(){
+  const box = document.getElementById('effortByKey');
+  if(!box) return;
+  const snap = RECENT_SNAPSHOT;
+  if(!snap || !snap.rows || !snap.rows.length){
+    box.innerHTML = '<div class="hint" style="margin:0">等待最近请求数据（网关页的「最近请求」每 5 秒刷新一次）…</div>';
+    return;
+  }
+  const stats = effortStatsByKey(snap.rows);
+  const shifted = stats.reduce((n, s) => n + s.shifted, 0);
+  const dropped = stats.reduce((n, s) => n + s.dropped, 0);
+  const num = (n, cls) => n > 0 ? '<span class="badge ' + cls + '">' + n + '</span>' : '<span style="color:var(--dim)">0</span>';
+  box.innerHTML = '<div class="hint" style="margin:0 0 8px">口径：<b>基于最近请求表当前页（第 ' + snap.page + ' 页 · 样本 '
+      + snap.rows.length + ' 条 / 全量 ' + fmt(snap.total) + ' 条）</b>，<b>不是</b>上方按 Key 矩阵的全量聚合——两者口径不同，数字不可相减。</div>'
+    + '<div class="table-wrap"><table><thead><tr>'
+    + '<th style="text-align:left">Key（仅标识）</th><th>样本</th><th>原样透传</th><th>被挪档</th><th>被丢弃</th><th>未请求</th>'
+    + '</tr></thead><tbody>'
+    + stats.map(s => {
+        const d = keyDisplay(s.key_id);
+        return '<tr>'
+          + '<td style="text-align:left">'
+          +   (d.cls ? '<span class="' + d.cls + '" title="' + d.title + '">' + d.label + (d.sub ? ' ' + d.sub : '') + '</span>'
+                     : '<b style="color:var(--fg)">' + d.label + '</b><div class="mono" style="color:var(--dim);font-size:10px">' + d.sub + '</div>')
+          + '</td>'
+          + '<td>' + s.total + '</td>'
+          + '<td>' + s.same + '</td>'
+          + '<td>' + num(s.shifted, 'warn') + '</td>'
+          + '<td>' + num(s.dropped, 'bad') + '</td>'
+          + '<td><span style="color:var(--dim)">' + s.none + '</span></td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table></div>'
+    + ((shifted || dropped) ? '' : '<div class="hint" style="margin:8px 0 0">这一页样本里没有出现挪档或丢弃。</div>');
 }
 
 async function loadAnalytics(){

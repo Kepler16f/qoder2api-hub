@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.2-2496ED?style=flat-square" alt="Version 1.3.2">
+  <img src="https://img.shields.io/badge/Release-v1.3.3-2496ED?style=flat-square" alt="Version 1.3.3">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -437,6 +437,33 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.3
+
+**✨ 新增功能**
+
+**① 前端测试破题**（工作包点名的第五类空白）：`tests/` 新增 **4 个前端断言套件（62 条）**，把前面几轮的前端证据**从会话里搬进仓库**：
+- **`effort_parity`（9 条）** —— **逐行审计列与汇总视图的四类计数一致性**。这是这批里最有价值的一条：同一份数据两处实现，口径一旦漂移，运维就会看到**互相矛盾的数**（与我们 `sum(by_key)==sum(by_account)` 是同一类问题）；
+- **`limits_auth`（19 条）** —— **403/401 分流**（把 403 当鉴权失效会让用户白白掉登录、真原因被吞 —— 这是修过的真 bug 的回归网）+ 限额保存载荷形状（空串=继承 / 0=关闭 原样传递）；
+- **`effort`（19 条）** —— 档位三态渲染 + Key 列四态；
+- **`log_and_badge`（15 条）** —— 日志**增量追加**的行为断言（追加而非重建）+ 护栏四态徽标。
+- 做法：**自读 `dashboard.html` + 抽 script 块 + 内联元素桩**，**没有引入 jsdom**（守住零依赖红线）；配两个工具：**`tests/_tools/dash_extract.js`**（锚点缺失即抛 —— 防「切片拿到空串、断言照样通过」这种**假绿**）与 **`dep_scan.py`**（迁移依赖扫描）。
+
+**② 按 Key 的档位分布**（矩阵下方）：一眼看出**哪个 Key 受影响最多**（多少请求被挪档、多少被丢弃）。这是把 P1-3 的审计口径从「逐行可见」升级成「按 Key 汇总可见」；**零额外请求**（复用已拉回的最近请求行）；口径行明写「基于最近请求页样本，**不是全量聚合、数字不可相减**」。
+
+**🐛 问题修复**：Key 列 tooltip 不再出现后端桶名的字面量 —— 界面（含 tooltip）均不泄露实现细节。
+
+**🎨 体验优化**：见 ② 的汇总视图。
+
+**⚠️ 其他变更**
+- **测试迁移策略调整（有数据支撑，不是妥协）**：写了一个依赖扫描工具（提取每段定义的全局名 → grep 后续段引用），跑完 **55 个段**后 `--leaf-only` **没有任何输出 —— 不存在纯叶子段**（段间共享显式全局如 `time` / `base64`，也有隐式的、供后续段继承的绑定）。
+  **结论：逐段迁移在这个文件结构下，边际成本已高于收益。** 因此调整为：**legacy 作终态**（它是**在用的测试文件**、630 条断言、持续全绿，不是技术债）、**新测试一律走新套件**、迁移只做低风险部分 —— 让它**自然冻结**，而不是强行拆完。
+- **迁移期三条纪律**（三次回滚换来的）：① **迁移与修 bug 不混在同一次编辑**；② **共享头部显式抽出**（别让每个套件自己抄 import）；③ **先做依赖扫描**（只有叶子段适合独立成套件）。
+
+**验证**
+- **双入口全绿**：`python tests/run_all.py` → **19 suites / 881 checks / 0 failed**；`python _test_qoder.py` → **630 checks / 626 passed / 0 failed / 4 skipped**；
+- **4 条「改坏 → 必红」自证**：parity（9 FAIL）· auth（7 FAIL）· log（10 FAIL）· effort（EXIT=1）—— 每条新套件都证明了自己**真的在守**，而不是「看起来绿」；
+- **一条工具经验**：改坏点里含**非 ASCII** 时 PowerShell 的转义会坑人（试两次没命中），**改用 Python 按行号替换**一次成功 —— 已记进团队纪律。
 
 ### v1.3.2
 
