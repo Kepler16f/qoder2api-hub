@@ -107,6 +107,18 @@ def set_panel_password(accounts_dir, password):
         save(accounts_dir, data)
 
 
+def lan_mode(accounts_dir):
+    """True when the gateway should listen on all interfaces (LAN-visible)."""
+    return load(accounts_dir).get("lan_mode") is True
+
+
+def set_lan_mode(accounts_dir, enabled):
+    with _lock:
+        data = load(accounts_dir)
+        data["lan_mode"] = bool(enabled)
+        save(accounts_dir, data)
+
+
 def api_key_override(accounts_dir):
     """Return (key, is_set). `is_set` means the panel manages the key."""
     data = load(accounts_dir)

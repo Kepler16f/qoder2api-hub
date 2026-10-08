@@ -580,6 +580,30 @@ a:hover{text-decoration:underline}
 
   <div id="pageSettings" style="display:none">
     <div style="margin-bottom:16px">
+      <h2 style="margin:0;font-size:16px;color:var(--fg)">设置</h2>
+    </div>
+
+    <div id="clientSettingsGroup" style="display:none;margin-bottom:16px">
+      <h2 style="margin:0;font-size:16px;color:var(--fg)">客户端设置</h2>
+    </div>
+    <section id="desktopSection" style="display:none">
+      <h2>桌面客户端</h2>
+      <div style="font-size:12px;color:var(--dim);margin-bottom:12px">
+        托盘与开机自启由桌面客户端主进程执行，修改后立即生效（仅桌面客户端内可见）。
+      </div>
+      <label class="desk-row">
+        <input type="checkbox" id="deskTray">
+        <span>关闭 / 最小化时收缩到系统托盘</span>
+      </label>
+      <div class="desk-note">开启后关窗不退出；真正退出请用托盘右键菜单的「退出」。</div>
+      <label class="desk-row" id="deskAutostartRow">
+        <input type="checkbox" id="deskAutostart">
+        <span>开机自动启动（静默进入托盘）</span>
+      </label>
+      <div class="desk-note" id="deskAutostartNote"></div>
+    </section>
+
+    <div style="margin:20px 0 16px">
       <h2 style="margin:0;font-size:16px;color:var(--fg)">网关设置</h2>
     </div>
 
@@ -614,28 +638,45 @@ a:hover{text-decoration:underline}
       <div id="keyList"></div>
     </section>
 
-    <section id="desktopSection" style="display:none">
-      <h2>桌面客户端</h2>
+    <section>
+      <h2>局域网访问 <em id="setLanState"></em></h2>
       <div style="font-size:12px;color:var(--dim);margin-bottom:12px">
-        托盘与开机自启由桌面客户端主进程执行，修改后立即生效（仅桌面客户端内可见）。
+        开启后同一局域网内的其他设备（手机 / 平板 / 另一台电脑）可以直接调用本机网关。
+        需要已配置 API Key；切换立即生效，重启后保持。
       </div>
       <label class="desk-row">
-        <input type="checkbox" id="deskTray">
-        <span>关闭 / 最小化时收缩到系统托盘</span>
+        <input type="checkbox" id="setLanToggle">
+        <span>局域网可见（其他设备可访问）</span>
       </label>
-      <div class="desk-note">开启后关窗不退出；真正退出请用托盘右键菜单的「退出」。</div>
-      <label class="desk-row" id="deskAutostartRow">
-        <input type="checkbox" id="deskAutostart">
-        <span>开机自动启动（静默进入托盘）</span>
-      </label>
-      <div class="desk-note" id="deskAutostartNote"></div>
+      <div id="lanInfo" style="display:none;margin-top:12px">
+        <table>
+          <tbody>
+            <tr><td>本机局域网 IP</td><td class="mono" id="setLanIps">-</td></tr>
+            <tr><td>API 地址</td><td class="mono" id="setLanApi">-</td></tr>
+            <tr><td>看板地址</td><td class="mono" id="setLanDash">-</td></tr>
+          </tbody>
+        </table>
+        <div style="margin-top:12px">
+          <div style="font-size:12px;color:var(--dim);margin-bottom:6px">调用样例（curl，Key 默认打码）：</div>
+          <pre id="setLanSample" style="margin:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;overflow-x:auto;white-space:pre;color:var(--fg)"></pre>
+          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap">
+            <button class="sec" onclick="copyLanSample(this)">复制样例</button>
+            <button class="sec" onclick="revealLanKey(this)">显示完整 Key</button>
+          </div>
+        </div>
+        <div class="desk-note" style="margin:10px 0 0">
+          首次开启时若 Windows 弹出防火墙提示，请选择「允许」；其他设备连不上时，
+          以管理员身份运行一次安装目录里的 allow-firewall.bat。
+        </div>
+      </div>
     </section>
 
     <section>
       <h2>运行信息</h2>
       <table>
         <tbody>
-          <tr><td>当前版本</td><td class="mono" id="setVersion">-</td></tr>
+          <tr><td>网关版本</td><td class="mono" id="setGatewayVersion">-</td></tr>
+          <tr><td>客户端版本</td><td class="mono" id="setClientVersion">-</td></tr>
           <tr><td>新版本检测</td>
               <td><span id="updateState" style="color:var(--dim)">尚未检查</span>
                   <span id="updateActions" style="margin-left:8px"></span>
@@ -2810,15 +2851,102 @@ async function loadSettings(showToast){
     renderKeyRows();
     updateUI();
     const set = (id, value) => { const el = document.getElementById(id); if(el) el.textContent = value || '-'; };
-    set('setVersion', data.version);
+    set('setGatewayVersion', data.gateway_version || data.version);
+    set('setClientVersion', data.client_version);
     set('setAccountsDir', data.accounts_dir);
     set('setUsageDir', data.usage_dir);
     set('setFile', data.settings_file);
     set('setSettingsFile', data.settings_file);
+    renderLanSection(data);
     if(showToast) toast('设置已刷新', 'ok');
-    if(desktopCRT) initDesktopSection();
+    if(desktopCRT()) initDesktopSection();
   } catch(e) {
     if(showToast) toast('读取设置失败: ' + e.message, 'bad');
+  }
+}
+
+/* ---- 局域网访问（网关设置）----
+   开关走 /settings/save {lan_mode}：网关持久化并运行时重绑监听地址；
+   调用样例里的 Key 默认打码，「显示完整 Key」经 /settings/reveal?id=gateway。 */
+let LAN_SAMPLE = {ip: '', port: '', key: ''};
+function lanSampleModel(){
+  try {
+    const list = (MODELS_DATA && MODELS_DATA.length) ? MODELS_DATA
+      : (MODELS_CACHE && Object.values(MODELS_CACHE)[0]) || [];
+    const first = (list || []).find(m => m && m.enabled !== false && m.id);
+    return first ? first.id : 'Qwen3-Coder';
+  } catch(e) { return 'Qwen3-Coder'; }
+}
+function renderLanSample(ip, port, key){
+  LAN_SAMPLE = {ip: ip, port: String(port), key: key || ''};
+  const el = document.getElementById('setLanSample');
+  if(!el) return;
+  el.textContent =
+    'curl http://' + ip + ':' + port + '/v1/chat/completions \\\n' +
+    '  -H "Authorization: Bearer ' + (key || '<API Key>') + '" \\\n' +
+    '  -H "Content-Type: application/json" \\\n' +
+    '  -d \'{"model": "' + lanSampleModel() + '", "messages": [{"role": "user", "content": "你好"}]}\'';
+}
+function renderLanSection(data){
+  const toggle = document.getElementById('setLanToggle');
+  const state = document.getElementById('setLanState');
+  const info = document.getElementById('lanInfo');
+  const on = !!data.lan_mode;
+  if(toggle && toggle.checked !== on) toggle.checked = on;
+  if(state){
+    state.textContent = on ? '(已开启)' : '(仅本机)';
+    state.style.color = on ? 'var(--accent2)' : 'var(--dim)';
+  }
+  if(info) info.style.display = on ? '' : 'none';
+  if(!on) return;
+  const ips = (data.lan_ips && data.lan_ips.length) ? data.lan_ips : ['<本机IP>'];
+  const port = data.bind_port || (location.port || '8790');
+  const set = (id, value) => { const el = document.getElementById(id); if(el) el.textContent = value || '-'; };
+  set('setLanIps', ips.join('  /  '));
+  set('setLanApi', 'http://' + ips[0] + ':' + port + '/v1');
+  set('setLanDash', 'http://' + ips[0] + ':' + port + '/');
+  renderLanSample(ips[0], port, data.effective_key_masked || data.api_key_masked);
+}
+async function toggleLan(on){
+  try {
+    const data = await postJSON('/settings/save', {lan_mode: !!on});
+    if(data.lan_error){
+      toast('已保存，但本次未能热切换：' + data.lan_error + '（重启后生效）', 'warn');
+    } else if(data.lan_rebinding){
+      toast(on ? '局域网可见已开启，正在切换监听…' : '已关闭局域网可见，正在切回本机…', 'ok');
+    } else {
+      toast('已保存，重启网关后生效', 'ok');
+    }
+    setTimeout(() => loadSettings(false), 1200);
+  } catch(e) {
+    toast('切换失败: ' + e.message, 'bad');
+    loadSettings(false);
+  }
+}
+async function copyLanSample(btn){
+  try {
+    const el = document.getElementById('setLanSample');
+    if(!el || !el.textContent.trim()){ toast('先开启局域网可见再复制', 'warn'); return; }
+    await writeClipboard(el.textContent);
+    if(btn){
+      const old = btn.textContent;
+      btn.textContent = '已复制';
+      setTimeout(() => { btn.textContent = old; }, 1600);
+    }
+    toast('调用样例已复制', 'ok');
+  } catch(e) {
+    toast('复制失败: ' + e.message, 'bad');
+  }
+}
+async function revealLanKey(btn){
+  try {
+    const data = await getJSON('/settings/reveal?id=gateway');
+    const key = (data.key || '').trim();
+    if(!key){ toast('当前没有可用的 API Key', 'warn'); return; }
+    renderLanSample(LAN_SAMPLE.ip || '<本机IP>', LAN_SAMPLE.port, key);
+    toast('已在样例中显示完整 Key（注意保密）', 'ok');
+  } catch(e) {
+    toast(e.message || '需要先修改面板密码才能查看明文 Key', 'bad');
   }
 }
 
@@ -3126,6 +3254,8 @@ function initDesktopSection(){
   const sec = document.getElementById('desktopSection');
   if(!sec) return;
   sec.style.display = '';
+  const group = document.getElementById('clientSettingsGroup');
+  if(group) group.style.display = '';
   const tray = document.getElementById('deskTray');
   const auto = document.getElementById('deskAutostart');
   const autoRow = document.getElementById('deskAutostartRow');
@@ -3146,6 +3276,8 @@ document.addEventListener('DOMContentLoaded', function(){
   const auto = document.getElementById('deskAutostart');
   if(tray) tray.addEventListener('change', () => desktopToggle('tray', tray.checked));
   if(auto) auto.addEventListener('change', () => desktopToggle('autostart', auto.checked));
+  const lan = document.getElementById('setLanToggle');
+  if(lan) lan.addEventListener('change', () => toggleLan(lan.checked));
 });
 function desktopToggle(kind, on){
   const ok = desktopSend({qd: 'set', key: kind, value: !!on});

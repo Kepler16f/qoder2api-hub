@@ -45,7 +45,7 @@ APP_NAME = "Qoder2API-Hub"
 APP_TITLE = "Qoder2API-Hub"
 # 桌面发行版版本：跟 GitHub release tag 走（发新版时同步 bump 这里）。
 # 检查更新用它对比最新 tag；网关本体的 VERSION 是另一条版本线（与上游对齐）。
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 DEFAULT_PORT = 8790
 LOG_NAME = "desktop-gateway.log"
 CONFIG_NAME = "desktop.json"
@@ -503,11 +503,11 @@ class Gateway(object):
             def run():
                 try:
                     import qoder_proxy
-                    argv = ["--host", host, "--port", str(port),
+                    # 不传 --host / --lan：监听范围以看板持久化的「局域网可见」
+                    # 为准（qoder_proxy.main 解析），壳配置只是菜单里的镜像。
+                    argv = ["--port", str(port),
                             "--accounts-dir", os.environ["ACCOUNTS_DIR"],
                             "--usage-dir", os.environ["QD_PROXY_USAGE_DIR"]]
-                    if lan:
-                        argv.append("--lan")
                     qoder_proxy.main(argv)
                 except SystemExit as exc:
                     if exc.code:
@@ -533,6 +533,9 @@ class Gateway(object):
         with self._lock:
             try:
                 import qoder_proxy
+                # 先清掉待执行的重绑请求：否则 shutdown 退出 serve 循环后
+                # 会被重绑分支吃掉，网关停不下来。
+                qoder_proxy.take_rebind_target()
                 server = qoder_proxy.SERVER
                 if server is not None:
                     killer = threading.Thread(target=server.shutdown, daemon=True)
@@ -858,12 +861,36 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
         root.title("%s · %s" % (APP_TITLE, text))
 
     port_var = tk.StringVar(value=str(cfg["port"]))
+    # 监听范围与看板「局域网可见」同源（accounts/settings.json）；
+    # 壳配置里的 lan 只是旧版本遗留的镜像，启动时对齐一次。
+    try:
+        import qoder_settings
+        if qoder_settings.lan_mode(paths["accounts"]):
+            cfg["lan"] = True
+    except Exception:
+        pass
     lan_var = tk.BooleanVar(value=cfg["lan"])
 
     def save_config_now():
         cfg["port"] = int(port_var.get())
         cfg["lan"] = bool(lan_var.get())
         save_config(config_path, cfg)
+
+    def toggle_lan():
+        """右键菜单的「允许局域网访问」：与看板开关同一条切换路径。"""
+        on = bool(lan_var.get())
+        try:
+            import qoder_proxy
+            ok, err, _rebinding = qoder_proxy.apply_lan_mode(on)
+        except Exception:
+            ok, err = True, ""
+        if ok:
+            cfg["lan"] = on
+            save_config(config_path, cfg)
+            set_status("局域网访问已%s" % ("开启" if on else "关闭"))
+        else:
+            lan_var.set(not on)   # 被拒绝（如免鉴权状态）：勾选回滚
+            set_status(err, color=RED)
 
     def copy_api():
         root.clipboard_clear()
@@ -930,8 +957,8 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
     menu.add_command(label="应用并重启", command=apply_restart)
     menu.add_command(label="修改端口…", command=change_port)
     menu.add_command(label="设置…", command=open_settings)
-    menu.add_checkbutton(label="允许局域网访问（重启生效）",
-                         variable=lan_var, command=save_config_now)
+    menu.add_checkbutton(label="允许局域网访问",
+                         variable=lan_var, command=toggle_lan)
     menu.add_separator()
     menu.add_command(label="复制接口地址", command=copy_api)
     menu.add_command(label="复制 API Key", command=copy_key)
@@ -942,6 +969,12 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
                      command=lambda: open_browser(port_var.get()))
 
     def popup_menu(event):
+        # 看板里可能已经切过开关：弹菜单前对齐一次实际监听状态。
+        try:
+            import qoder_proxy
+            lan_var.set(qoder_proxy.BIND_HOST == "0.0.0.0")
+        except Exception:
+            pass
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1476,12 +1509,37 @@ def run_linux_shell(state, cfg, config_path, paths, auto_close_ms=None):
         win.setWindowTitle("%s · %s" % (APP_TITLE, text))
 
     port_holder = {"v": int(cfg["port"])}
+    # 与看板「局域网可见」同源（accounts/settings.json），启动时对齐一次。
+    try:
+        import qoder_settings
+        if qoder_settings.lan_mode(paths["accounts"]):
+            cfg["lan"] = True
+    except Exception:
+        pass
     lan_holder = {"v": bool(cfg["lan"])}
 
     def save_config_now():
         cfg["port"] = int(port_holder["v"])
         cfg["lan"] = bool(lan_holder["v"])
         save_config(config_path, cfg)
+
+    def toggle_lan(on):
+        """右键菜单的「允许局域网访问」：与看板开关同一条切换路径。"""
+        try:
+            import qoder_proxy
+            ok, err, _rebinding = qoder_proxy.apply_lan_mode(bool(on))
+        except Exception:
+            ok, err = True, ""
+        if ok:
+            lan_holder["v"] = bool(on)
+            cfg["lan"] = bool(on)
+            save_config(config_path, cfg)
+            set_status("局域网访问已%s" % ("开启" if on else "关闭"))
+        else:
+            lan_holder["v"] = not bool(on)
+            cfg["lan"] = not bool(on)
+            save_config(config_path, cfg)
+            set_status(err, color=RED)
 
     def copy_api():
         app.clipboard().setText(
@@ -1533,11 +1591,16 @@ def run_linux_shell(state, cfg, config_path, paths, auto_close_ms=None):
         menu = QMenu(win)
         menu.addAction("应用并重启", apply_restart)
         menu.addAction("修改端口…", change_port)
-        act_lan = menu.addAction("允许局域网访问（重启生效）")
+        # 看板里可能已经切过开关：弹菜单前对齐一次实际监听状态。
+        try:
+            import qoder_proxy
+            lan_holder["v"] = qoder_proxy.BIND_HOST == "0.0.0.0"
+        except Exception:
+            pass
+        act_lan = menu.addAction("允许局域网访问")
         act_lan.setCheckable(True)
         act_lan.setChecked(lan_holder["v"])
-        act_lan.toggled.connect(lambda on: (lan_holder.__setitem__("v", on),
-                                            save_config_now()))
+        act_lan.toggled.connect(toggle_lan)
         menu.addSeparator()
         menu.addAction("复制接口地址", copy_api)
         menu.addAction("复制 API Key", copy_key)

@@ -328,6 +328,19 @@ def identify_key(supplied):
     return qoder_settings.match_api_key(ACCOUNTS_DIR, supplied, extra_keys=extra)
 
 
+def effective_call_key():
+    """A credential that actually authenticates /v1 right now.
+
+    Used for the LAN call sample in the panel: when panel-managed keys exist
+    they are the only accepted credentials, so the sample must show one of
+    those - not the launcher key the .bat file may still carry.
+    """
+    for entry in configured_keys():
+        if entry.get("enabled"):
+            return entry.get("key") or ""
+    return API_KEY or ""
+
+
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
@@ -842,6 +855,125 @@ SERVER = None   # ThreadingHTTPServer 实例；main() 运行期间非 None，供
 ACCOUNTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts")
 REALM_STATE_FILE = os.path.join(ACCOUNTS_DIR, "active_realm.json")
 
+# ---------------------------------------------------------------------------
+# 监听地址与运行时重绑（看板「局域网访问」开关）
+# ---------------------------------------------------------------------------
+BIND_HOST = os.environ.get("HOST") or "127.0.0.1"
+BIND_PORT = int(os.environ.get("PORT") or "8790")
+_bind_lock = threading.Lock()
+_rebind_target = None      # (host, port)；由请求线程置位，主循环消费
+
+
+def request_rebind(host, port=None):
+    """把监听地址切到 host:port（端口默认不变）。返回 (ok, err)。
+
+    面板请求线程只负责置位并触发 serve_forever 退出；真正的
+    server_close + 重新 bind 在主循环里做（socket 生命周期只有一个主人）。
+    """
+    global _rebind_target
+    server = SERVER
+    if server is None:
+        return False, "gateway is not running"
+    with _bind_lock:
+        _rebind_target = (str(host), int(port or BIND_PORT))
+
+    def _kick():
+        time.sleep(0.4)          # 让本次 HTTP 响应先写回客户端
+        try:
+            server.shutdown()
+        except Exception as exc:
+            log("rebind shutdown failed: %s" % exc, level="ERROR")
+
+    threading.Thread(target=_kick, name="rebind", daemon=True).start()
+    return True, ""
+
+
+def take_rebind_target():
+    """主循环取一次待执行的重绑请求（没有则 None）。"""
+    global _rebind_target
+    with _bind_lock:
+        target = _rebind_target
+        _rebind_target = None
+    return target
+
+
+def apply_lan_mode(enabled):
+    """切换「局域网可见」：持久化 + 保证有 Key + 运行时重绑。
+
+    面板 /settings/save 与桌面壳右键菜单共用这一条路径，两个入口永远
+    一致。返回 (ok, err, rebinding)：ok=False 表示拒绝切换（err 为可直接
+    展示的中文原因）；rebinding=False 表示已持久化但要重启才生效。
+    """
+    global API_KEY
+    enabled = bool(enabled)
+    if enabled and qoder_settings.auth_disabled(ACCOUNTS_DIR):
+        # LAN 模式下网关花的是账号自己的上游额度；免鉴权 + 全网卡监听
+        # 等于把额度开放给全网段，必须先关掉「免鉴权」。
+        return False, ("当前网关处于「免鉴权」状态：局域网可见会把账号额度"
+                       "开放给整个网段。请先在设置里关闭免鉴权（并配置 "
+                       "API Key），再打开局域网可见。"), False
+    if enabled and not auth_required() and not API_KEY:
+        # 开 LAN 必须有 Key：没有就现场生成一枚并持久化（同 --lan）。
+        API_KEY, _created = qoder_settings.ensure_launcher_key(ACCOUNTS_DIR)
+    qoder_settings.set_lan_mode(ACCOUNTS_DIR, enabled)
+    ok, err = request_rebind("0.0.0.0" if enabled else "127.0.0.1")
+    return True, "", bool(ok)
+
+
+# ---------------------------------------------------------------------------
+# 账号自动刷新：上游报 401/403/429 或其它非瞬时错误后，隔一小会儿自动刷新
+# 一次令牌。刷新成功即清冷却/错误回到选号池，避免账号一直挂着报错。
+# ---------------------------------------------------------------------------
+AUTO_REFRESH_DELAY = float(os.environ.get("QD_AUTO_REFRESH_DELAY") or 20)
+AUTO_REFRESH_MIN_GAP = 60.0     # 同一账号两次自动刷新之间的最短间隔
+_auto_refresh_lock = threading.Lock()
+_auto_refresh_recent = {}
+
+
+def schedule_auto_refresh(account, reason, revive=False, delay=None):
+    """安排一次延时令牌刷新（每账号节流）。返回是否真的排上。
+
+    revive=True：本次错误已把账号置为停用（session dead）——刷新成功时
+    重新启用，否则保持停用等待人工重登。
+    """
+    if account is None:
+        return False
+    uid = getattr(account, "uid", "") or ""
+    now = time.time()
+    with _auto_refresh_lock:
+        if now - _auto_refresh_recent.get(uid, 0.0) < AUTO_REFRESH_MIN_GAP:
+            return False
+        _auto_refresh_recent[uid] = now
+    wait = AUTO_REFRESH_DELAY if delay is None else float(delay)
+
+    def _run():
+        time.sleep(max(0.0, wait))
+        try:
+            ok = account.refresh()
+        except Exception as exc:
+            log("auto-refresh crashed on %s: %s" % (uid[:8], str(exc)[:160]),
+                level="ERROR", tag="accounts")
+            return
+        if ok:
+            if revive:
+                account.enabled = True
+                if getattr(account, "path", ""):
+                    try:
+                        account.save(os.path.dirname(account.path))
+                    except Exception as exc:
+                        log("auto-refresh save failed on %s: %s"
+                            % (uid[:8], exc), level="WARN", tag="accounts")
+            account.clear_error()
+            log("auto-refresh ok on %s (%s): token renewed, back in pool"
+                % (uid[:8], reason), tag="accounts")
+        else:
+            log("auto-refresh failed on %s (%s): %s"
+                % (uid[:8], reason, account.last_error or "unknown"),
+                level="WARN", tag="accounts")
+
+    threading.Thread(target=_run, name="auto-refresh", daemon=True).start()
+    return True
+
 
 def load_persisted_realm():
     global CURRENT_REALM
@@ -1214,6 +1346,10 @@ def runtime_settings_view():
         masked = key[:4] + "*" * 6 + key[-4:]
     else:
         masked = "*" * len(key)
+    # 局域网调用样例展示用：当前真正能过鉴权的那把 Key 的掩码。
+    eff = effective_call_key()
+    eff_masked = (eff[:4] + "*" * 6 + eff[-4:]) if len(eff) > 8 \
+        else ("*" * len(eff))
     keys = []
     for entry in configured_keys():
         raw = entry.get("key") or ""
@@ -1239,6 +1375,16 @@ def runtime_settings_view():
         "usage_dir": USAGE_DIR,
         "settings_file": qoder_settings.settings_path(ACCOUNTS_DIR),
         "version": VERSION,
+        # 两条版本线分开暴露：网关本体走 VERSION（与上游对齐）；
+        # 桌面发行版 tag 由桌面壳注入 QD_APP_VERSION，纯网关跑法为空。
+        "gateway_version": VERSION,
+        "client_version": (os.environ.get("QD_APP_VERSION") or "").strip(),
+        # 局域网可见开关：当前状态 + 实际监听地址 + 本机各网卡 IP
+        "lan_mode": (BIND_HOST == "0.0.0.0"),
+        "bind_host": BIND_HOST,
+        "bind_port": BIND_PORT,
+        "lan_ips": local_ip_addresses() if BIND_HOST == "0.0.0.0" else [],
+        "effective_key_masked": eff_masked,
     }
 
 
@@ -3505,6 +3651,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         account.note_error("envelope 429", model=model, cooldown=retry_secs)
         log("account %s throttled via envelope (429), cooling for %ds"
             % (account.uid[:8], retry_secs), level="WARN", tag="chat")
+        schedule_auto_refresh(account, "envelope 429")
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
@@ -3520,9 +3667,12 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             account.save(ACCOUNTS_DIR) if account.path else None
             log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
                 % account.uid[:8], level="ERROR")
+        schedule_auto_refresh(account, "envelope HTTP %s" % status_int,
+                              revive=dead)
     else:
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=15, single_account=(total <= 1))
+        schedule_auto_refresh(account, "envelope HTTP %s" % status_int)
 
 def should_retry_envelope(exc, emitted_bytes, attempt):
     """流内错误信封是否值得**重开上游**再试。
@@ -3764,6 +3914,7 @@ def open_upstream(payload, session_key=None, target_realm=None, _sweeps=0):
                     % (account.uid[:8], model))
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
+                schedule_auto_refresh(account, "HTTP 429")
                 last_error = exc
                 last_429 = exc
                 last_429_detail = detail
@@ -3782,6 +3933,8 @@ def open_upstream(payload, session_key=None, target_realm=None, _sweeps=0):
                     account.save(ACCOUNTS_DIR) if account.path else None
                     log("account %s session dead (TOKEN_EXPIRE) - disabled"
                         % account.uid[:8], level="ERROR")
+                schedule_auto_refresh(account, "HTTP %d" % exc.code,
+                                      revive=dead)
                 last_error = exc
                 continue
             if _is_transient_upstream(exc.code, detail):
@@ -3803,6 +3956,7 @@ def open_upstream(payload, session_key=None, target_realm=None, _sweeps=0):
                     POOL.affinity.unbind(session_key)
                 account.note_error("HTTP %s: %s" % (exc.code, detail[:80]),
                                    cooldown=60, single_account=(total <= 1))
+                schedule_auto_refresh(account, "HTTP %s" % exc.code)
                 last_error = exc
                 continue
             raise
@@ -5304,7 +5458,12 @@ class Handler(BaseHTTPRequestHandler):
         return (self.headers.get("X-Panel-Token") or "").strip()
 
     def _panel_ok(self):
-        return PANEL.valid(self._panel_token())
+        ok = PANEL.valid(self._panel_token())
+        if not ok and os.environ.get("QD_DEBUG_PANEL"):
+            log("panel check failed: token=%r known_tokens=%d"
+                % ((self._panel_token() or "")[:10], len(PANEL._tokens)),
+                level="WARN")
+        return ok
 
     @staticmethod
     def _is_panel_route(path):
@@ -5601,6 +5760,10 @@ class Handler(BaseHTTPRequestHandler):
                     "Key。请先在「设置 → 面板密码」修改密码，再查看明文 Key。",
                     "permission_error")
             wanted = (query.get("id") or [""])[0]
+            if wanted == "gateway":
+                # 局域网调用样例用：当前真正能过 /v1 鉴权的那把 Key。
+                return self._json(200, {"id": "gateway",
+                                        "key": effective_call_key()})
             for entry in configured_keys():
                 if entry.get("id") == wanted:
                     return self._json(200, {"id": wanted,
@@ -5721,12 +5884,27 @@ class Handler(BaseHTTPRequestHandler):
             API_KEY = new_key
             API_KEY_FILE_SET = True
             reply["api_key_set"] = bool(new_key)
+        if "lan_mode" in payload:
+            wanted = payload.get("lan_mode")
+            if not isinstance(wanted, bool):
+                return self._error(400, "lan_mode must be true or false",
+                                   "invalid_request_error")
+            ok, err, rebinding = apply_lan_mode(wanted)
+            if not ok:
+                return self._error(400, err, "invalid_request_error")
+            reply["lan_mode"] = wanted
+            reply["lan_rebinding"] = rebinding
+            if not rebinding:
+                reply["lan_error"] = err or "rebind failed"
         if payload.get("restart_scheduler"):
             if SCHEDULER:
                 SCHEDULER.stop()
                 SCHEDULER.start()
             reply["scheduler"] = "restarted"
         reply.update(runtime_settings_view())
+        if "lan_mode" in payload:
+            # 目标状态优先于运行时快照：重绑约 1 秒后才反映到 BIND_HOST。
+            reply["lan_mode"] = bool(payload.get("lan_mode"))
         return self._json(200, reply)
 
     def _handle_panel(self, path):
@@ -6546,7 +6724,7 @@ def acc_realm(account):
 def main(argv=None):
     # argv=None 时读 sys.argv（命令行用法不变）；桌面壳等内嵌调用方传 list。
     global POOL, ACCOUNTS_DIR, API_KEY, SYSTEM_PROMPT, USAGE_DIR, USAGE_LOG, \
-        USAGE_SUMMARY, SCHEDULER, SERVER
+        USAGE_SUMMARY, SCHEDULER, SERVER, BIND_HOST, BIND_PORT
     API_KEY_GENERATED = False
     ap = argparse.ArgumentParser(
         description="Qoder (qoder.com.cn / qoder.com) -> OpenAI-compatible proxy")
@@ -6578,8 +6756,6 @@ def main(argv=None):
                          "admin)")
     args = ap.parse_args(argv)
 
-    if args.lan and args.host == "127.0.0.1":
-        args.host = "0.0.0.0"
     if args.usage_dir:
         USAGE_DIR = os.path.abspath(args.usage_dir)
         USAGE_LOG = os.path.join(USAGE_DIR, "usage.jsonl")
@@ -6631,6 +6807,15 @@ def main(argv=None):
     SYSTEM_PROMPT = args.system_prompt
     if args.accounts_dir:
         ACCOUNTS_DIR = os.path.abspath(args.accounts_dir)
+    # 看板持久化的「局域网可见」与 --lan 等效（重启后仍生效）；--host 显式
+    # 指定时以命令行为准，不覆盖。桌面壳不再传 --host，走这条持久化路径。
+    host_explicit = "--host" in (argv if argv is not None else sys.argv[1:])
+    if not host_explicit and args.host == "127.0.0.1" \
+            and (args.lan or qoder_settings.lan_mode(ACCOUNTS_DIR)):
+        args.lan = True
+    if args.lan and args.host == "127.0.0.1":
+        args.host = "0.0.0.0"
+    BIND_HOST, BIND_PORT = args.host, args.port
     # LAN 模式绝不能带默认密钥：网关花的是账号自己的上游额度，
     # 可猜的默认值等于让全网段的人白嫖。首次生成一次并持久化。
     if args.lan and not API_KEY:
@@ -6764,7 +6949,47 @@ def main(argv=None):
     _ctrl_handler = install_console_close_handler()
     try:
         SERVER = server   # 桌面壳等内嵌调用方经此优雅停机（shutdown() 须跨线程调）
-        server.serve_forever()
+        while True:
+            server.serve_forever()
+            target = take_rebind_target()
+            if target is None:
+                break   # 真停机（桌面壳 stop / Ctrl+C / 关窗）
+            host, port = target
+            log("rebinding  : %s:%d (lan mode %s)"
+                % (host, port, "on" if host == "0.0.0.0" else "off"))
+            # socket 生命周期只有一个主人：先彻底关旧监听再绑新的，
+            # 否则 Windows 的 SO_REUSEADDR 会让两个 socket 同抢一个端口。
+            try:
+                server.server_close()
+            except Exception:
+                pass
+            SERVER = None
+            new_server = None
+            try:
+                new_server = ThreadingHTTPServer((host, port), Handler)
+            except OSError as exc:
+                log("rebind to %s:%d failed - %s" % (host, port, exc),
+                    level="ERROR")
+            if new_server is None:
+                # 重绑失败退回原地址：LAN 开不起来至少本机还可用；关 LAN
+                # 失败维持原状。开关已持久化，重启后按新值生效。
+                try:
+                    old_host, old_port = server.server_address
+                    new_server = ThreadingHTTPServer((old_host, old_port),
+                                                     Handler)
+                    host, port = old_host, old_port
+                    log("fell back to %s:%d - lan switch applies after "
+                        "restart" % (old_host, old_port), level="WARN")
+                except OSError:
+                    log("fallback rebind failed too - gateway stopping",
+                        level="ERROR")
+                    break
+            server = new_server
+            SERVER = server
+            BIND_HOST, BIND_PORT = host, port
+            log("listening  : http://%s:%d/v1  (api key: %s)"
+                % (host, port, "on" if API_KEY else "off"))
+            log("dashboard  : http://%s:%d/" % (host, port))
     except KeyboardInterrupt:
         log("bye")
     finally:
