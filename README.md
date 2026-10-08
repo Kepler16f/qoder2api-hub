@@ -124,6 +124,14 @@ docker run -d --name qoder-proxy --restart unless-stopped \
   -e API_KEY=your_secret_key ghcr.io/shuishuipingan/qoder2api-hub:latest
 ```
 
+> **镜像与版本入口**：[**GHCR 包页面**](https://github.com/shuishuipingan/qoder2api-hub/pkgs/container/qoder2api-hub)（列出全部可用 tag、架构与拉取命令）· [**Releases**](https://github.com/shuishuipingan/qoder2api-hub/releases)（每个版本的变更说明）。
+>
+> 可用 tag：**`latest`** · **`1.3`**（跟随最新 1.3.x）· **具体版本**（如 `1.3.3`）· **`sha-<短提交>`**（钉死某次构建）。镜像为 **linux/amd64 + linux/arm64** 双架构。
+>
+> 提示：GitHub 仓库**首页侧栏**未必列出容器包 —— 用上面那个包页面链接即可，或直接 `docker pull ghcr.io/shuishuipingan/qoder2api-hub:latest`。
+
+```
+
 - **持久化目录**：`./accounts`（账号凭证及出口设置）与 `./usage`（请求流水与指标快照）；
 - **配置参数**：环境变量 `API_KEY`、`PORT`（监听端口，默认 8790）、`HOST`（监听地址，默认 127.0.0.1；容器内如需对外暴露设为 0.0.0.0）。
 
