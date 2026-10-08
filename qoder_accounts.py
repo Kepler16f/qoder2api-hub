@@ -876,6 +876,47 @@ def next_checkin_window(now=None):
 # 阈值默认 0 = 关闭（R4：量纲未核对，上线由使用方显式开）。
 _QUOTA_LOCK = threading.Lock()          # R6：限额字段专用锁（不是 _SAVE_LOCK）
 
+# ---------------------------------------------------------------------------
+# 账号级失败治理（task-74）：软限流退避 / 硬错误熔断 / 未知错误降权
+# ---------------------------------------------------------------------------
+# 移植自 wb_accounts.py:376-411（三族 + 常量）。**不另起冷却系统**：
+#   · note_soft_rate 复用 cooldown_until（与普通冷却同字段、同判定路径）；
+#   · note_failure / note_unknown_failure 各占一个新窗口字段，但在
+#     ready() / throttle_wait() 里与既有冷却**同一处**取用（不是并行判定）；
+#   · 全部状态读写走同一把 _QUOTA_LOCK（与护栏同锁；不用 _SAVE_LOCK 文件锁）。
+# 复位路径（每族）见各方法 docstring；统一入口 Account.note_success()。
+SOFT_RATE_BASE = 600.0          # 账号级 429 首次退避：10 分钟
+SOFT_RATE_MAX = 7200.0          # …按 2 的幂翻倍，封顶 2 小时
+BREAKER_THRESHOLD = 3           # 连续硬失败达到该次数才起跳熔断
+BREAKER_COOLDOWN = 1800.0       # 首次熔断窗口：30 分钟
+BREAKER_COOLDOWN_MAX = 21600.0  # …封顶 6 小时
+DEGRADE_THRESHOLD = 5           # 连续未知失败达到该次数才降权
+DEGRADE_COOLDOWN = 600.0        # 首次降权窗口：10 分钟
+DEGRADE_COOLDOWN_MAX = 7200.0   # …封顶 2 小时
+
+
+def _exponential_backoff(count, base, cap, offset):
+    """base * 2 ** (count - offset)，封顶 cap、最多放大 20 步（wb:391 同式）。"""
+    step = max(0, int(count) - int(offset))
+    return min(float(base) * (2 ** min(step, 20)), float(cap))
+
+
+def soft_backoff(streak):
+    """连续 streak 次软限流对应的退避秒数。"""
+    return _exponential_backoff(streak, SOFT_RATE_BASE, SOFT_RATE_MAX, 1)
+
+
+def breaker_backoff(fails):
+    """连续 fails 次硬失败对应的熔断窗口秒数。"""
+    return _exponential_backoff(fails, BREAKER_COOLDOWN, BREAKER_COOLDOWN_MAX,
+                                BREAKER_THRESHOLD)
+
+
+def degrade_backoff(fails):
+    """连续 fails 次未知失败对应的降权窗口秒数。"""
+    return _exponential_backoff(fails, DEGRADE_COOLDOWN, DEGRADE_COOLDOWN_MAX,
+                                DEGRADE_THRESHOLD)
+
 
 def _scope_limit_value(scope, realm):
     """三级作用域取值：realm override > global > 0（与 qoder_settings.limit_value 同语义）。
@@ -1125,6 +1166,12 @@ class Account(object):
         self.expiring_window_days = 0       # R7：即将过期窗口（天），默认 0 = 关
         self.balance_until = 0.0            # 402 停放（时钟 = UTC+8 每日 10:00，R5）
         self.balance_reason = ""
+        # task-74 失败治理三族（运行期状态，重启重置）：
+        self.soft_streak = 0                # 连续软限流（429）计数，喂 cooldown_until
+        self.fails = 0                      # 连续硬失败计数（喂熔断）
+        self.degrade_count = 0              # 连续未知失败计数
+        self.breaker_until = 0.0            # 硬错误熔断窗口截止（ready() 会挡）
+        self.degrade_until = 0.0            # 未知错误降权窗口截止（不挡 ready）
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
@@ -1216,6 +1263,9 @@ class Account(object):
             "inExpiringWindow": self.in_expiring_window(),
             "balanceParked": self.balance_until > time.time(),
             "balanceUntil": self.balance_until or None,
+            "softStreak": int(self.soft_streak),
+            "breakerFor": round(max(0.0, self.breaker_until - time.time())) or None,
+            "degradeFor": round(max(0.0, self.degrade_until - time.time())) or None,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
@@ -1260,6 +1310,8 @@ class Account(object):
             return False
         # ---- task-61：账号级预算护栏（纯内存读，无网络分支；R1）----
         if self.balance_until > time.time():       # 402 停放（UTC+8 10:00 解封）
+            return False
+        if self.breaker_until > time.time():       # task-74 硬错误熔断窗口（自动恢复）
             return False
         if self.reserve_blocked():                 # G1 余额地板
             return False
@@ -1374,6 +1426,13 @@ class Account(object):
         跳过：no_expiry / package_code == "enterprise"（企业额度是重置不是作废）/
         is_expired；只接受 days_left >= 0 且 remain > 0 的包。
         未知数据永不构成偏好（R7：expiring_window_days 默认 0 = 关闭）。
+
+        S1 实测（2026-10）：上游 /quota/usage 的 userQuota / addOnQuota 内部
+        **没有**任何到期字段——真正的到期只有响应**顶层** expiresAt（已原样存
+        在 credits["expires_at"]；其归属未经证实，故不映射到包级：误贴会把
+        「按月重置」的额度算成临期、反向消耗）。因此在真实数据上本函数恒返回
+        None = 偏好不触发（安全侧）；fetch_credits 已对未来的包级到期字段做
+        透传，上游一补就自动生效（回归守卫见 tests/_test_credit_expiry.py）。
         """
         cred = self.credits
         if not isinstance(cred, dict):
@@ -1484,7 +1543,8 @@ class Account(object):
         if not self.enabled or not self.access_token:
             return 0.0
         now = time.time()
-        wait = max(0.0, self.cooldown_until - now)
+        wait = max(0.0, self.cooldown_until - now,
+                   self.breaker_until - now)
         if model:
             wait = max(wait, max(0.0, self.model_cooldowns.get(model, 0.0) - now))
         return wait
@@ -1497,6 +1557,90 @@ class Account(object):
         if self.last_error or self.cooldown_until:
             self.last_error = ""
             self.cooldown_until = 0
+
+    # -- 失败治理三族（task-74；状态写入统一走 _QUOTA_LOCK）------------------
+    def note_soft_rate(self, message):
+        """三族一：账号级软限流（429 类）→ 指数退避，复用 cooldown_until。
+
+        第 n 次连续软限流退避 min(600 * 2^(n-1), 7200) 秒（封顶 2 小时）。
+        复位：note_success() 立即清零；或退避自然到期。退避不是封禁——本方
+        法绝不改 enabled，账号只是稍后再试。
+        """
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.soft_streak += 1
+            wait = soft_backoff(self.soft_streak)
+            deadline = time.time() + wait
+            if deadline > self.cooldown_until:
+                self.cooldown_until = deadline
+        return wait
+
+    def note_failure(self, message):
+        """三族二：硬错误熔断——连续 >= BREAKER_THRESHOLD 次才起跳窗口。
+
+        窗口期间 ready() 直接 False（不再重试）；窗口过后自动恢复（连续失败
+        越多窗口越长，封顶 6 小时）。复位：note_success() 清计数与窗口。
+        注意：凭证永久失效（session dead）仍走既有 enabled=False 路径，不是
+        本族——那是必须重新登录，不是稍后自愈。
+        """
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.fails += 1
+            if self.fails >= BREAKER_THRESHOLD:
+                wait = breaker_backoff(self.fails)
+                deadline = time.time() + wait
+                if deadline > self.breaker_until:
+                    self.breaker_until = deadline
+        return self.breaker_until
+
+    def note_unknown_failure(self, message):
+        """三族三：未知错误降权窗口——不是不可用。
+
+        连续 >= DEGRADE_THRESHOLD 次后进入降权窗口：ready() 不受影响（账号仍
+        可用），但 AccountPool._rotate_pick 两轮扫描会先跳过降权中的账号，只
+        有没有更健康候选时才回落使用它（不楔死）。同时喂熔断计数（未知也可
+        能真是硬错误）。复位：note_success() 清零；窗口自然到期隐式恢复。
+        """
+        with _QUOTA_LOCK:
+            self.last_error = str(message)[:200]
+            self.degrade_count += 1
+            self.fails += 1
+            now = time.time()
+            if self.degrade_count >= DEGRADE_THRESHOLD:
+                wait = degrade_backoff(self.degrade_count)
+                deadline = now + wait
+                if deadline > self.degrade_until:
+                    self.degrade_until = deadline
+            if self.fails >= BREAKER_THRESHOLD:
+                wait = breaker_backoff(self.fails)
+                deadline = now + wait
+                if deadline > self.breaker_until:
+                    self.breaker_until = deadline
+        return self.degrade_until
+
+    def degraded(self, now=None):
+        """是否处于降权窗口（供选号排序降权；非阻断，不参与 ready）。"""
+        now = now if now is not None else time.time()
+        return self.degrade_until > now
+
+    def note_success(self, model=None):
+        """一次成功请求清空全部账号级惩罚（三族计数 + 软冷却 + 模型冷却）。
+
+        三族的统一复位入口：成功后 soft_streak / fails / degrade_count 归零、
+        breaker / degrade 窗口清零。刻意不动 balance_until——402 停放专属，
+        只由 revive_balance_cooldown() 在余额刷新看到 remain>0 时解除（两套
+        机制不合并，见 03 文档 2.9.4 的移植约定）。
+        """
+        with _QUOTA_LOCK:
+            if model:
+                self.model_cooldowns.pop(model, None)
+            self.soft_streak = 0
+            self.fails = 0
+            self.degrade_count = 0
+            self.breaker_until = 0.0
+            self.degrade_until = 0.0
+            self.last_error = ""
+            self.cooldown_until = 0.0
 
     # -- 出站头 ------------------------------------------------------------
     def headers(self, purpose="openapi"):
@@ -2186,6 +2330,33 @@ class Account(object):
             except Exception:
                 return 0.0
 
+        def _expiry_of(src):
+            """把上游额度对象里的到期信息**防御性透传**进 packages（存在才写）。
+
+            S1 实测（2026-10）：上游 userQuota / addOnQuota 内部**没有**任何
+            到期字段，只有响应顶层 expiresAt（归属未证实，刻意不映射到包级——
+            误贴会把「按月重置」的额度算成临期，反向消耗）。本函数只做透传、
+            不臆造：哪天上游补上 expiresAt / daysLeft / packageCode，
+            soonest_expiring_days 无需改码即可生效。
+            """
+            if not isinstance(src, dict):
+                return {}
+            out = {}
+            for key in ("expiresAt", "expireAt", "expires_at"):
+                if src.get(key) is not None:
+                    out["expires_at"] = normalize_epoch(src[key])
+                    break
+            for key in ("daysLeft", "days_left"):
+                if src.get(key) is not None:
+                    out["days_left"] = src[key]
+                    break
+            if src.get("noExpiry") is not None:
+                out["no_expiry"] = bool(src.get("noExpiry"))
+            code = src.get("packageCode") or src.get("package_code")
+            if code:
+                out["package_code"] = str(code)
+            return out
+
         remain = int(_num(uq, "remaining") + _num(aq, "remaining"))
         used = int(_num(uq, "used") + _num(aq, "used"))
         size = int(_num(uq, "total") + _num(aq, "total"))
@@ -2198,9 +2369,11 @@ class Account(object):
             "expires_at": normalize_epoch(q.get("expiresAt")),
             "packages": [
                 {"name": "基础额度", "remain": int(_num(uq, "remaining")),
-                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total"))},
+                 "used": int(_num(uq, "used")), "size": int(_num(uq, "total")),
+                 **_expiry_of(uq)},
                 {"name": "赠送/签到额度", "remain": int(_num(aq, "remaining")),
-                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total"))},
+                 "used": int(_num(aq, "used")), "size": int(_num(aq, "total")),
+                 **_expiry_of(aq)},
             ],
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -2776,7 +2949,12 @@ class AccountPool(object):
         return self._weighted_pick(cands)
 
     def _rotate_pick(self, realm=None, exclude=None, model=None):
-        """纯 round-robin（原 pick 的实现，逐字保留）。"""
+        """纯 round-robin + 两轮降权扫描（task-74 三族之三）。
+
+        第一轮先跳过降权窗口内的账号（degraded()），第二轮不跳过——降权号仍然
+        可用（不是封禁），只是没有更健康候选时才回落使用（不楔死）。无降权号
+        的池行为与原实现逐字节一致。
+        """
         exclude = exclude or set()
         with self._lock:
             snapshot = [a for a in self.accounts if not realm or a.realm == realm]
@@ -2784,15 +2962,19 @@ class AccountPool(object):
         total = len(snapshot)
         if total == 0:
             return None
-        for offset in range(total):
-            index = (start + offset) % total
-            account = snapshot[index]
-            if account.uid in exclude:
-                continue
-            if account.ready(model=model):
-                with self._lock:
-                    self._cursor = (index + 1) % total
-                return account
+        now = time.time()
+        for skip_degraded in (True, False):
+            for offset in range(total):
+                index = (start + offset) % total
+                account = snapshot[index]
+                if account.uid in exclude:
+                    continue
+                if skip_degraded and account.degraded(now):
+                    continue
+                if account.ready(model=model):
+                    with self._lock:
+                        self._cursor = (index + 1) % total
+                    return account
         return None
 
     def pick(self, realm=None, exclude=None, model=None):

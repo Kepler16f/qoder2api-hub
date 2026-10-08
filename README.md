@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.0-2496ED?style=flat-square" alt="Version 1.3.0">
+  <img src="https://img.shields.io/badge/Release-v1.3.1-2496ED?style=flat-square" alt="Version 1.3.1">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -434,6 +434,43 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+### v1.3.1
+
+**✨ 新增功能**
+
+**① 测试工程化** —— `tests/` 并发编排上线：
+- `tests/run_all.py`：**并发**、每套件独立日志、失败打 tail 25 行、强制 UTF-8、无匹配套件返回 2（防「0 passed / 0 failed → exit 0」这种假绿）；
+- **11 个套件 / 747 条断言**，含工作包点名的三类空白：**代理不变量**（参数穿透式断言 + 基线登记）、**keep-alive 早拒**（裸 socket）、**前端 DOM 断言**（首个 `.js` 套件，自读 dashboard.html + 内联元素桩）；
+- **兼容入口保留**：`python _test_qoder.py` 照旧可用；套件正逐段从它迁出（本轮已迁 2 段，legacy 仍承载其余 —— **迁移期间总数只增不减**）；
+- ⚠️ **一处更正**：工作包让照抄的 wb `tests/_dom_stub.js` **并不存在**（递归查 0 命中）；它的真实做法就是「每个套件自读 dashboard.html + 内联手写约 15 行元素桩」，我们按后者实现，没有引入 jsdom（保住零依赖）。
+
+**② 账号退避 / 熔断 / 降权三族**：
+- `note_soft_rate`（软限流**指数退避**：600 → 1200 → 2400，封顶 7200）· `note_failure`（硬错误**熔断**）· `note_unknown_failure`（未知错误**降权**）· `note_success`（统一复位入口）；
+- **接线 6 处** —— 这正是教训所在：三族在接上调用点之前**是死代码**（有断言证明接线前 6 处计数全 0）；
+- **防误接（反例断言）**：直连 401/403 · **信封 429（10605 排队，接了会让一次排队冷掉全账号）** · 内容审核 · **402 余额不足** · 单号池 → 三族**零调用**；
+- **单号池不接**（`total>1` 条件）：单号池接熔断/长退避 = **变相打死账号**；
+- 运维恢复：三族状态是**内存态**（不落盘）→ 重启即清 / 等窗口自动过（30 分钟起、封顶 6 小时）；面板的「重新启用」走 `clear_error`，**有意不清熔断**。
+
+**③ 用量字段与聚合**：
+- usage 行补 `reasoning_effort` / `reasoning_effort_requested` / `key_id`（全脱敏）；**三态可辨**：同值 = 原样透传 · 不同 = 被挪档 · **空串 = 请求了但未下发**；
+- 新增 **`GET /usage/by-key`**（与 `/usage/by-account` **逐字对称**；`sum(by_key) == sum(by_account)` 不变量已断言；缺 `key_id` 的行归 `(no-key)` 桶、**不丢弃**）；
+- 面板：最近请求表加 **Key** 与 **档位** 两列（档位三态一眼可辨）· 指标页新增**按 API Key 用量透视**（Key / 请求数 / 输入 / 输出（含思考）/ 缓存 / 总 token / 占比 / 积分 / 模型前 5，按 token 降序）。
+
+**🐛 问题修复**
+- **临期积分分派：管道就绪、当前不触发** —— 实测上游 `/quota/usage` **不返回 per-package 到期字段**（只有顶层 `expiresAt`，且它可能是「按月重置」而非「到期作废」）。处置：**防御性透传**（上游一旦补字段即自动生效、无需改码）+ **刻意不把顶层 `expiresAt` 贴到包级** —— 硬贴会让「按月重置」的额度被**优先消耗**（反向浪费）。
+
+**🎨 体验优化**：见 ③ 的两处 UI（档位三态 + 按 Key 透视）。
+
+**⚠️ 其他变更**
+- **测试方法论（写入团队配方）**：parity 类断言**只能用 `requests` / token / `credit`**（`models` 是**前 5 名截断**的展示字段，拿它求和必假失败）；error 行**两侧都跳过**；窗口按 `row["at"]`（epoch）过滤、**完全不看 `iso`**，且**缺 `at` 的行被当 0**（夹具必须给 `at`）；窗口边界是**闭区间**；**桶数不等是正常语义**（一个 Key 可打多个账号）。
+- **验证配方补充**：任何「逐字节一致」类对照**必须用固定夹具或同一份快照** —— 真实日志仍在被追加（`analytics` 统计 error 行、 `by_account` 跳过），否则会把「日志在长」误判成「改动引入差异」。
+
+**验证**
+- **双入口全绿**：`python tests/run_all.py` → **11 suites / 747 checks / 0 failed**；`python _test_qoder.py` → **658 checks / 0 failed / 4 skipped**；
+- **每个新套件都有「改坏 → 必红」自证**（本轮 6 条：护栏等号边界 · 代理绕过点 · 前端配色 · 三族接线计数 · parity 口径 · dashboard 渲染）；
+- **三族接线**：接线前 **6 红**（计数全 0，正是 6 个待接点）→ 接线后 **13 绿**；
+- **parity 修绿**的过程本身也是个证据：期望值先按实测口径**重算**（无窗口 645 / day 145），而不是改实现去迁就断言。
+
 ### v1.3.0
 
 > **自 v1.2.12 以来的主要变更概览**：机器身份落盘缓存 + 种子机制修正（容器重建不再换设备）、VM 抖动多数表决（不把身份固定在少数派）、工具历史结构化直传、只读积分路由 `GET /credits/summary`、usage credit 统计修复 —— 以及本版两项：**事实性限额护栏**与**用量区间 / 时间序列**。
@@ -446,7 +483,9 @@ python _verify_models.py --base http://127.0.0.1:8790
 - **后台余额刷新**：每 tick 最多刷一个最陈旧账号（30min tick + 12h TTL），**惰性启动**（阈值全 0 时线程根本不存在，零副作用）；
 - **计数来自本地 usage 折叠** —— 不新增任何上游调用；
 - **402 / 额度停放**：停到 **UTC+8 每日 10:00**（qoder 自己的重置窗口，非通用 4am），**仅余额恢复**可提前解封；
-- **临期积分优先分派**：7 天内到期的额度优先消耗（smooth weighted round-robin），默认窗口 0（关）；
+- **临期积分优先分派**：7 天内到期的额度优先消耗（smooth weighted round-robin），**默认窗口 0（关）**。
+  - ⚠️ **当前状态（重要）**：上游额度接口**不返回 per-package 到期字段**（实测只有 `total/used/remaining/percentage/unit`，到期信息只有顶层 `expiresAt`）→ **即使开启窗口也不会生效**；
+  - 我们做了**防御性透传**（上游一旦补字段即自动生效，无需改码），并**刻意不把顶层 `expiresAt` 贴到包级** —— 它可能是「**按月重置**」而不是「到期作废」，硬贴会让这类额度被**优先消耗**（反向浪费）；
 - **面板**：设置页限额表格（带**量纲提示**）+ 账号行**四态徽标**（未启用 / 未知 / 已暂停 / 正常）。
 
 **② 用量区间与时间序列**：`/usage/analytics` · `/usage/by-account` · `/usage/perf` 支持 `?range=day|week|month|all|custom&since=&until=`；新增 **`/usage/timeseries`**；`realm=all` 现在是真正的通配符（此前 `/usage/perf` 采样恒为 0）。
