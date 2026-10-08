@@ -55,7 +55,7 @@ from pathlib import Path
 # 网关版本自 2026-10 起改用日期命名（YYYY.MM.DD），与上游的 1.2.x semver 号线
 # 天然不撞（历史 fork 曾占用 1.2.18/1.2.19/1.2.20，与上游 1.2.18 撞车后才改制）。
 # 桌面发行线是另一套号(v1.3.x tag)，「检查更新」按它对比本仓库 Releases。
-VERSION = "2026.10.07"
+VERSION = "2026.10.08"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -419,6 +419,14 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     if fields["prompt_tokens"] > 0:
         row["cache_hit_pct"] = round(
             fields["cached_tokens"] * 100.0 / fields["prompt_tokens"], 1)
+    if fields["prompt_tokens"] > 820000:
+        # 实测口径的兜底观测：上游总 token 硬顶 ~88.4 万，输入贴顶后输出
+        # 会被压到几十~几百 token（表现为"输出到一半断掉"）。压缩预算
+        # （QD_PROMPT_TOKEN_BUDGET，估算口径）没拦住时在这里提醒校准。
+        log("prompt tokens %d near upstream total-token ceiling (~884k) "
+            "on '%s' - output budget squeezed; lower QD_PROMPT_TOKEN_BUDGET "
+            "or compact the session" % (fields["prompt_tokens"], model),
+            level="WARN", tag="chat")
     with _lock:
         _usage["requests"] += 1
         for k in USAGE_FIELDS:
@@ -3191,6 +3199,174 @@ def structured_tool_history_enabled(model="", model_key="", realm="",
     return False
 
 
+# ---------------------------------------------------------------------------
+# 输入预算控制：上游对总 token（in+out）有硬顶（实测 Qwen3.8-Flash
+# ~88.4 万：usage 里 total_tokens 的 top 全部挤在 88.0-88.4 万，输入越贴近
+# 顶、输出被掐得越早——表现为"输出到一半断掉"，而流本身正常结束、网关
+# 无任何错误）。会话历史线性增长撞顶后，单条 tool 结果的削减（2000+2000
+# 字符）杯水车薪。这里在代理侧做**渐进式上下文压缩**（从轻到重，达标即停），
+# 只在极端情况下才兜底丢弃最老轮。
+# ---------------------------------------------------------------------------
+PROMPT_TOKEN_BUDGET_DEFAULT = 700000    # 估算 token 软上限（留 ~18 万输出缓冲）
+_HISTORY_KEEP_LIGHT = 1200               # 档A：单侧保留字符（全部历史轮）
+_HISTORY_KEEP_HEAVY = 350                # 档B：单侧保留字符（最老的一半轮）
+_HISTORY_SUMMARY_CHARS = 160             # 档C：单行摘要字符数（最老的四分之一轮）
+
+
+def _prompt_token_budget():
+    """QD_PROMPT_TOKEN_BUDGET：正整数=启用；0/off=关闭；非法=默认。"""
+    raw = (os.environ.get("QD_PROMPT_TOKEN_BUDGET") or "").strip().lower()
+    if not raw:
+        return PROMPT_TOKEN_BUDGET_DEFAULT
+    if raw in ("0", "off", "none", "false", "no", "disable", "disabled"):
+        return 0
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return PROMPT_TOKEN_BUDGET_DEFAULT
+
+
+def _estimate_tokens(messages):
+    """粗估会话 token：字符/3 + 每消息固定开销 + tool_calls 序列化。
+
+    误差 ±30%（中英代码混合），做软预算足够——预算本身就留了大缓冲。
+    """
+    total = 0
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        total += 8
+        c = m.get("content")
+        if isinstance(c, str):
+            total += len(c) // 3
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict):
+                    total += len(str(part.get("text") or "")) // 3
+        calls = m.get("tool_calls")
+        if calls:
+            total += len(json.dumps(calls, ensure_ascii=False)) // 3
+    return total
+
+
+def _turn_boundaries(messages):
+    """轮区间 [(start, end)]：一条 user 消息开启一轮，到下一条 user 前。"""
+    turns = []
+    start = None
+    for i, m in enumerate(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            if start is not None:
+                turns.append((start, i))
+            start = i
+    if start is not None:
+        turns.append((start, len(messages)))
+    return turns
+
+
+def _compress_content(text, keep):
+    """头尾各保留 keep 字符，中间替换为省略标记（幂等：短文本原样返回）。"""
+    if not isinstance(text, str) or len(text) <= keep * 2 + 200:
+        return text
+    head, tail = text[:keep], text[-keep:]
+    omitted = len(text) - len(head) - len(tail)
+    return (head + "\n[[qoder-proxy: 已省略 %d 字符历史内容]]\n" % omitted
+            + tail)
+
+
+def _summarize_content(text, limit=_HISTORY_SUMMARY_CHARS):
+    """压成单行摘要：首 limit 字符 + 省略标记（保留消息骨架与角色）。"""
+    if not isinstance(text, str) or len(text) <= limit + 60:
+        return text
+    flat = " ".join(text.split())          # 摘要压掉换行，视觉上单行
+    if len(flat) <= limit:
+        return flat
+    return flat[:limit] + " …[[qoder-proxy: 已压缩为摘要]]"
+
+
+def compress_prompt_budget(messages, model=""):
+    """估算超预算时对**历史轮**做渐进压缩（system 与最后一轮永不碰）。
+
+    档位从轻到重，每档作用于全部历史轮、每档后重新估算，达标即停：
+      A. 历史轮 content 截断（头尾各 _HISTORY_KEEP_LIGHT 字符）
+      B. 历史轮 content 截断（头尾各 _HISTORY_KEEP_HEAVY 字符）
+      C. 历史轮 content 压成单行摘要（tool_calls 骨架保留）
+      D. 兜底：仍超才从最老轮开始丢弃（至少保留最近 2 轮）
+
+    返回 (新列表, 动作描述)。幂等：客户端每轮发全量历史，本函数每请求
+    重新评估；压缩作用于副本，不动调用方的 payload。
+    """
+    budget = _prompt_token_budget()
+    if budget <= 0 or not messages:
+        return messages, ""
+    est = _estimate_tokens(messages)
+    if est <= budget:
+        return messages, ""
+    turns = _turn_boundaries(messages)
+    if len(turns) <= 1:
+        return messages, ""        # 只有一轮：宁可不压（当前轮必须完整）
+    first_user = next(
+        (i for i, m in enumerate(messages)
+         if isinstance(m, dict) and m.get("role") == "user"),
+        len(messages))
+    hist_end = turns[-1][0]         # 最后一轮（当前轮）起点：之前的都是历史
+    out = [dict(m) if isinstance(m, dict) else m for m in messages]
+    est0, actions = est, []
+    rng = range(first_user, hist_end)
+
+    def _apply(fn, label):
+        saved = 0
+        for i in rng:
+            m = out[i]
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                new = fn(c)
+                if new is not c and len(new) < len(c):
+                    saved += len(c) - len(new)
+                    m["content"] = new
+        if saved > 0:
+            actions.append("%s(-%d chars)" % (label, saved))
+            return True
+        return False
+
+    for keep, label in ((_HISTORY_KEEP_LIGHT, "stageA"),
+                        (_HISTORY_KEEP_HEAVY, "stageB")):
+        if _apply(lambda t, k=keep: _compress_content(t, k), label):
+            est = _estimate_tokens(out)
+            if est <= budget:
+                break
+    if est > budget:
+        _apply(_summarize_content, "stageC")
+        est = _estimate_tokens(out)
+    # 档D：兜底丢弃最老轮（至少保留最近 2 轮 + system）
+    hist_turns = turns[:-1]
+    drop_until = first_user
+    while est > budget and len(hist_turns) > 2:
+        si, ei = hist_turns.pop(0)
+        est -= _estimate_tokens(out[si:ei])
+        drop_until = ei
+    if drop_until > first_user:
+        actions.append("dropped %d oldest msgs" % (drop_until - first_user))
+        note = ("[[qoder-proxy: 会话历史过长（估算约 %d token，超过 %d 预算），"
+                "更早的对话已压缩/省略以保护输出预算]]\n\n" % (est0, budget))
+        kept = list(out[drop_until:])
+        if kept and isinstance(kept[0], dict) \
+                and kept[0].get("role") == "user" \
+                and isinstance(kept[0].get("content"), str):
+            first = dict(kept[0])
+            first["content"] = note + first["content"]
+            kept[0] = first
+        else:
+            kept.insert(0, {"role": "user", "content": note.strip()})
+        out = list(out[:first_user]) + kept
+    if actions:
+        log("prompt budget: est %d tokens > %d on '%s' - %s"
+            % (est0, budget, model, ", ".join(actions)),
+            level="WARN", tag="chat")
+    return out, "; ".join(actions)
+
+
 def flatten_messages(messages, keep_reasoning=False, structured=False):
     """把客户端会话压平成 Qoder 上游可接受的 {role, content} 序列。
 
@@ -3306,6 +3482,9 @@ def build_qoder_body(payload, account, model_key, realm=None):
     messages = sanitize_messages(messages)
     model = payload.get("model") or ""
     messages = backfill_reasoning_content(messages, model, model_key)
+    # 输入预算：估算超限时对历史轮做渐进压缩（system/当前轮不动），
+    # 防止会话历史撞上游总 token 硬顶后输出被掐（见 compress_prompt_budget）
+    messages, _budget_note = compress_prompt_budget(messages, model)
 
     use_structured = structured_tool_history_enabled(
         model=model, model_key=model_key, realm=r, messages=messages)
