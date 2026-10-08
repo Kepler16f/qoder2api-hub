@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.2.18-2496ED?style=flat-square" alt="Version 1.2.18">
+  <img src="https://img.shields.io/badge/Release-v1.2.19-2496ED?style=flat-square" alt="Version 1.2.19">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -433,6 +433,27 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.2.19
+
+**✨ 新增功能**：无
+
+**🐛 问题修复**
+- **usage 记录（与面板）的 credit 统计恒为 0**（issue #22，by @jianjiuss）：`_extract_usage()` 读的是**单数** `usage.get("credit")`，而上游给的是**复数 `credits`**（附 `original_credits` / `billable`）—— `usage.get("credit")` 恒为 None，于是**所有** usage 记录都记成 0（报告者实测 426 条流式 + 16 条非流式全部为 0）。
+  - 现在**复数 `credits` 优先、保留单数兜底**（防其它区域字段差异）；
+  - 顺带记录 **`original_credits`**（**参与聚合** —— 折扣时段对账要用）与 **`billable`**（仅写进行、**不进聚合** —— 布尔求和没有意义）。
+
+**🎨 体验优化**：无
+
+**⚠️ 其他变更**
+- **历史数据不可回填**：修复只影响此后写入的行；此前记录里的那个 0 是**永久性的**（当时的原始 `credits` 从未落盘）。我们不会在日志或文档里暗示它可恢复。
+
+**验证**
+- 全量 **657 checks / 0 failed**（[39] 段 10 条）；
+- **修复前的红色证据已留存**（落盘前抓到的原始输出：复数 `credits=97.96` → `credit: 0`；两者都有时旧实现取单数）—— 没有它，这个回归网就是空转；
+- **变异自证 4 条**：改回只读单数 → 必红；单数优先 → 必红；抽掉 `original_credits` → 必红；把 `billable` 塞进聚合表 → 必红；
+- **面板不受影响**（已 grep 确证：它读的是账号对象的 `credits.remain`、模型元数据的 `credits`、签到侧的 `earned_credit`，**没有一处**读 usage 行的 `credit`）；
+- 未覆盖（如实）：`credits` 为字符串或 `None` 的形态（`or` 链会把 `"0"` 当假值，属理论边界）。
 
 ### v1.2.18
 

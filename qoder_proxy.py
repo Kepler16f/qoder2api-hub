@@ -52,7 +52,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.2.18"
+VERSION = "1.2.19"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -288,7 +288,10 @@ USAGE_SUMMARY = os.path.join(USAGE_DIR, "usage-summary.json")
 DASHBOARD_HTML = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "dashboard.html")
 USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
-                "cached_tokens", "total_tokens", "credit")
+                "cached_tokens", "total_tokens", "credit",
+                # issue #22：折扣时段对账要用的原价积分（数值，参与聚合）。
+                # billable 是布尔值，**不做聚合**、只写进 JSONL 行（见 _extract_usage）。
+                "original_credits")
 
 # Web-panel access control. The panel is gated by its own password (default
 # "admin"), independent of the /v1 API key. Sessions live in memory only.
@@ -328,7 +331,8 @@ def identify_key(supplied):
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
-            "total_tokens": 0, "credit": 0.0, "started": time.time(),
+            "total_tokens": 0, "credit": 0.0, "original_credits": 0.0,
+            "started": time.time(),
             "by_model": {},
             "ttft_ms_sum": 0, "ttft_samples": 0,
             "gen_ms_sum": 0, "gen_samples": 0,
@@ -351,7 +355,14 @@ def _extract_usage(usage):
         "cached_tokens": usage.get("prompt_cache_hit_tokens")
         or details.get("cached_tokens") or prompt_details.get("cached_tokens") or 0,
         "total_tokens": usage.get("total_tokens") or 0,
-        "credit": usage.get("credit") or 0,
+        # issue #22：上游给的是**复数 credits** —— 旧实现只读单数 credit，
+        # 恒为 None -> 所有 usage 记录成 0（历史数据无法回填，原始值未落盘）。
+        # 保留单数兜底以兼容其它区域/版本的字段差异。
+        "credit": usage.get("credits") or usage.get("credit") or 0,
+        "original_credits": usage.get("original_credits") or 0,
+        # billable 只记录不聚合（布尔求和无意义）：进 JSONL 行，不进
+        # USAGE_FIELDS 的累加与 by_model。
+        "billable": bool(usage.get("billable")),
     }
 
 
