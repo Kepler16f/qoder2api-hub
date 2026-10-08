@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.1-2496ED?style=flat-square" alt="Version 1.3.1">
+  <img src="https://img.shields.io/badge/Release-v1.3.2-2496ED?style=flat-square" alt="Version 1.3.2">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -183,6 +183,10 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 - **流式响应使用 HTTP/1.1 `Transfer-Encoding: chunked`** 并以 `0\r\n\r\n` 正确收尾，**不再发 `Connection: close`**：同一个 keep-alive 连接可连续复用（实测同连接连发 5 次流式全部成功）。此前裸写字节 + `close` 会让连接池型客户端复用已半关闭的连接，表现为反复重连。
 - **SSE 心跳保活**：上游首字延迟实测可达 **40–71 秒**（`xhigh` + 2–3 万 token 长上下文），等待期间网关每 5 秒发送一个 SSE 注释帧 `: ping`（客户端规范要求忽略），避免客户端/中间代理空闲超时断连重连。可用环境变量 `QD_SSE_HEARTBEAT` 调整间隔（秒，`0` 关闭）。
 - **探活端点**：`GET /ping`（以及 `/healthz`、`/livez`、`/readyz`）返回纯文本 `pong`，**不需要面板密码或 API Key、不查账号池**——供客户端/脚本判活用；此前返回 404 会被判成网关不可用而反复重连。完整状态仍看 `GET /health`。
+
+- **出口代理（零代码）**：网关用标准库发请求、**未禁用 `ProxyHandler`**，所以 urllib 默认会读环境变量 `HTTPS_PROXY` / `HTTP_PROXY` —— **需要换出口（例如国际版走代理）时，设置这两个环境变量就行，不必改配置**；容器里用 `-e HTTPS_PROXY=... ` 传入。
+  - 若你用的是 **fake-ip 模式的透明代理**（Clash 等），网关已内置 `_FAKEIP_NETS` 把 fake-ip 网段视为有效，**不会**因为 DNS 把域名解析成内网地址而拒绝请求。
+  - 说明：我们**没有**做「按账号绑定不同出口」那套（每账号独立代理槽 + 出口情报）—— 因为账号都由你本机导入、出口天然相同，实测也没有「上游按 IP 风控」的信号。**将来若真撞上按 IP 风控**，最小方案是给账号加一个可选 `proxy` 字段并让出站走 `ProxyHandler`（约 25 行）。
 
 - **积分汇总（只读，给下游轮询用）**：`GET /credits/summary` —— 走 **API-key 级鉴权**（`_key_ok`：API Key 或面板会话均可，未设 Key 时放行），**只返回本地已登记的 `credits`，绝不触发任何上游查询**（对照 `GET /accounts/credits`：那个会**逐号强制刷新**，适合作者手动点、不适合机器轮询）。
   - 返回：`{ by_realm: {cn, intl}, totals: {remain, accounts}, accounts: [{uid, nickname, realm, credits_remain, credits_used, credits_size, registered_at}], note }`；
@@ -433,6 +437,39 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.3.2
+
+**✨ 新增功能**
+
+**① Anthropic 原生入口 `/v1/messages`** —— Claude Code 这类 Anthropic 客户端可直接接入：
+- 新增独立转换模块 `qoder_anthropic.py`（**零依赖纯标准库**）：入站映射（14 个字段）、出站（非流式 + 流式事件流）、usage 守恒映射、effort 断点映射（逐模型 clamp + 单调不降）；
+- **接线的三条要害**（都配了断言）：① **`x-api-key` 头**（Anthropic 客户端不用 Bearer，漏了会**全量 401**）；② **形态决策单点**（结构化与否只判一次；两处各判会出现「桥接层以为结构化、flatten 走文本化」的错配）；③ **守卫链逐字复用**：`sse_with_heartbeat(recover_leaked_tool_calls(iter_inner_sse(...), allowed_names=...))`，且 `allowed_names` 必须取**转换后的** chat 请求（用 Anthropic 原始 payload 会取不到工具名 → 回读守卫失效）；
+- **泄漏回归（新入口）**：#8 / #9 / #11 三条历史样本走新入口 → **守卫仍然生效**（有日志实证），#8 还能正确还原成 `tool_use` 块。**新入口没有变成第三个绕过守卫的门**；
+- **三条已知差异**（已写进 README 已知限制）：**流式不做流内信封重开**（`message_start` 已发出、重开等于两个 start，协议违规；改为发明确的 `event: error` 终态事件而非静默关流；非流式仍完整重试）· **默认不发 thinking block**（Anthropic 要求 `signature`，我们生成不了也**不伪造**；`QD_ANTHROPIC_THINKING=empty` 为实验开关）· **入站 thinking 一律丢弃**。
+
+**② 模型闸门**：全局 `banned_models` + 每个 API Key 的 `models` 白名单（fnmatch 通配）。
+- **统一落点 `_model_precheck`、三个入口共用**（chat / responses / anthropic）—— **不是三份实现**，天然没有「某个入口绕过」的缺口（已用断言覆盖 `/v1/messages`）；
+- **拒绝发生在本地**：出站层与网络层**两层计数均为 0**；并含**对照组**（白名单内放行）与**默认不变**（空配置放行）—— 防「一律拒绝也绿」；
+- 同理，`_clean_key_entry` 是白名单重建，**`models` 必须显式保留**（否则每次保存被静默丢弃 —— 与早前 limits 同型的坑，已断言钉住）。
+
+**③ 会话亲和长度上限**：`QD_AFFINITY_MAX_MSGS`（**默认 0 = 关闭**）。⚠️ **阈值没有照抄参考项目** —— 那张断连率表来自单一实例、333 个请求，上游也不同；等我们自己的数据再定。
+
+**🐛 问题修复**：无
+
+**🎨 体验优化**：Anthropic 入口的三条已知差异写进 README（读者需要知道边界在哪）。
+
+**⚠️ 其他变更**
+- **`tool_choice="none"` 形态对齐**：从「连 `tools` 一起删」改为「**保留 `tools` + 写回 none**」。上游 body 对比确认**只影响 `tools` 一个字段**（其余 7 个非随机顶层键全同）；开关 `QD_TOOLCHOICE_NONE_DROPS_TOOLS=1` 可一键回退。
+  - ⚠️ **一条反例（如实登记）**：参考项目自己的注释说「**其上游并不真正遵守 none**」（保留 tools 后仍回 `tool_calls`），**与我们工作包对 qoder 的实测相反**。我们按 qoder 的实测默认新行为，但**留了回退开关** —— 若观察到 `none` 下仍回 `tool_calls`，设它即回旧行为。
+- **出站收口**（P1-2 第一步）：把带凭证的直连收进统一出站函数（不变量基线 **3 → 2**，且**中间态红过**，证明断言在守）；**并判定「按账号出站代理」不做** —— 账号全部由用户本机导入（出口天然相同）、全局代理已**零代码支持**（`HTTPS_PROXY`，README 已补）、无任何「上游按 IP 风控」信号。若将来真撞上，最小方案约 25 行（已留档）。
+- **测试工程化**：`tests/` 编排现 **15 个套件 / 819 断言**；从旧单体文件**已迁出 4 段**（每批双入口对比、账目精确）；迁移期两条纪律已写进 `tests/README.md`（路径一律基于 `__file__`；每套件自己的临时目录、不写仓库内共享路径）。
+
+**验证**
+- **双入口全绿**：`python tests/run_all.py` → **15 suites / 819 checks / 0 failed**；`python _test_qoder.py` → **626 checks / 0 failed / 4 skipped**；
+- **本轮新增能红证据 3 组**：Anthropic 模块（改前 `ModuleNotFoundError`）· 接线（**4 红 → 16 绿**）· 模型闸门（**4 红 → 16 绿**，明细显示`未实现时请求放行到出站口`）；
+- **旁路核查**：确认模型闸门三入口共用同一判定，**不存在「chat 被拦、messages 绕过」**；
+- **一处自我更正也已登记**：某次 `run_all` 出现过 1 failed，追查为**撞上并发编辑的中间态**（不是回归）；重跑 0 failed。这也提醒：**并行开发期的瞬时红要先排除中间态再当回归**。
 
 ### v1.3.1
 
@@ -1092,6 +1129,16 @@ python _install_umid.py          # 从官方 npm 包提取内嵌的原生 UMID �
 ### 3. 真实上游链路未经端到端验证
 
 本轮发布的改动经过：离线确定性测试（587 断言）、模块级 `py_compile`、静态核对与变异反证；**Docker 构建与容器内 UMID 组件执行**已在 Docker Desktop 29.7.2 实测（issue #12：`docker build` 成功 → 容器内 `/app/umid/runtime-info` 可执行并返回真实身份字段）。**真实上游端到端**仍未在发布环境实跑，请以你自己的部署环境验证为准。
+### 4. Anthropic `/v1/messages` 入口的三条已知差异
+
+网关提供 Anthropic 原生协议入口（`POST /v1/messages` 与 `POST /v1/messages/count_tokens`），供 Claude Code 等客户端直连（客户端用 `x-api-key` 头鉴权，网关同时接受 `Authorization: Bearer`）。为免误解，三条差异如实登记：
+
+- **流式不做「流内信封重开」**：上游可能先以 HTTP 200 建流、再在 SSE 信封里投递业务错误（如 418）。Chat Completions 路径此时会**重开上游重试**；Anthropic 路径**不重开** —— 因为 `message_start` 已经发出，重开会让客户端收到**两个 `message_start`**（协议违规，客户端容忍度未知）。取而代之的是一条明确的终态事件 `event: error`（含可读 message），而不是静默关流。**非流式仍会重试**（此时尚未向客户端写出任何字节，重试安全）。
+- **默认不返回思考内容（thinking block）**：Anthropic 规范要求 `thinking` block 携带服务端生成的 `signature`，而网关无法生成该签名（也不校验回传签名）。因此默认**不发 thinking block** —— 客户端只看到正文与工具调用，看不到模型的思考过程。可用环境变量 `QD_ANTHROPIC_THINKING=empty` 打开实验模式（发送带**空** `signature` 的 thinking block；客户端若做非空校验可能报错）。**不提供**伪造签名的选项。
+- **入站 `thinking` block 一律丢弃**：多轮历史里回传的 thinking block 不会被转发给上游——我们无法验证其签名，也不该把无签名思考回灌（避免污染模型的推理连贯性）。
+
+> 这三条都**不影响** Chat Completions（`/v1/chat/completions`）与 Responses（`/v1/responses`）两条既有入口。
+> 另：`/v1/messages/count_tokens` 是**本地估算**（CJK 感知），不产生任何上游调用；`/v1/messages` 的工具历史同样复用既有的结构化/文本化两条链路与全部回读吞掉守卫（issue #8/#9/#11 的样本已在新入口回归）。
 
 ---
 

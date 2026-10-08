@@ -37,6 +37,7 @@ import socket
 import ssl
 import sys
 import threading
+import fnmatch
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +45,7 @@ import urllib.request
 import uuid
 
 import qoder_accounts
+import qoder_anthropic
 import qoder_catalog
 import qoder_settings
 import qoder_sign
@@ -52,9 +54,43 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
+
+
+def is_model_banned(model):
+    """P1-4：True = 该模型在本机被全局封禁，不送去上游。
+
+    配置源：settings 的 banned_models（fnmatch pattern 列表，默认空 = 不封禁）。
+    读配置失败一律 fail-open（不误封）。与 wb 的差异：配置在 settings 而非代码
+    常量——本仓已有面板/设置机制。
+    """
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    try:
+        patterns = qoder_settings.banned_models(ACCOUNTS_DIR)
+    except Exception:
+        return False
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
+
+
+def banned_model_message(model):
+    """封禁模型的本机拒绝文案（完全不碰上游）。"""
+    return ("模型 %s 已被本机网关封禁（settings 的 banned_models 配置）。"
+            "如需使用，请在设置页或 settings.json 里调整 banned_models。"
+            % model)
+
+
+def key_model_message(entry, model):
+    """每 Key 模型限制的拒绝文案（与全局封禁同风格）。"""
+    name = (entry or {}).get("name") or "未命名"
+    allowed = "、".join((entry or {}).get("models") or []) or "-"
+    asked = str(model or "").strip() or "(未指定模型)"
+    return ("API Key「%s」的模型限制不允许 %s。该 Key 目前允许：%s。"
+            "请在设置页修改该 Key 的模型限制，或改用允许该模型的 Key。"
+            % (name, asked, allowed))
 
 
 # 198.18.0.0/15 (RFC 2544 benchmarking) 与 fdfe:dcba:9876::/48 被 Clash/mihomo
@@ -1566,6 +1602,14 @@ AFFINITY_BY_PREFIX = os.environ.get("QD_AFFINITY_BY_PREFIX", "1").lower() not in
     "0", "false", "no", "off")
 AFFINITY_DEBUG = os.environ.get("QD_AFFINITY_DEBUG", "0").lower() in (
     "1", "true", "yes", "on")
+# P1-6 会话亲和长度上限：对话超过该条数就不再绑定账号（长对话的请求体只会越来越大，
+# 钉在同一账号等于让下一轮同样超长）。0 = 关闭上限，**默认关闭**，行为与改动前一致。
+# 阈值不照搬参考项目：那张断连率表来自其单一实例的 333 个请求、上游也不同，本仓无
+# 自有曲线，因此先给机制、等实测再定值。非数字取值按 0 处理（不在 import 期抛异常）。
+try:
+    AFFINITY_MAX_MSGS = int(os.environ.get("QD_AFFINITY_MAX_MSGS", "0") or 0)
+except (TypeError, ValueError):
+    AFFINITY_MAX_MSGS = 0
 
 
 def derive_affinity_key(messages):
@@ -1580,6 +1624,12 @@ def derive_affinity_key(messages):
     try:
         msgs = messages or []
         if not msgs:
+            return None
+        # P1-6：超长对话放弃亲和（== 上限仍绑定，> 上限释放）
+        if AFFINITY_MAX_MSGS > 0 and len(msgs) > AFFINITY_MAX_MSGS:
+            if AFFINITY_DEBUG:
+                log("affinity: skip %d msgs (> %d), letting the pool rotate"
+                    % (len(msgs), AFFINITY_MAX_MSGS))
             return None
         head = msgs[:2]
         blob = json.dumps(head, ensure_ascii=False,
@@ -2544,6 +2594,15 @@ def backfill_reasoning_content(messages, model, model_key=""):
     return out
 
 
+# P2-2：tool_choice="none" 时是否连 tools 一起删（历史行为）。
+# 默认**保留** tools 并把 "none" 原样写回 —— 工具能力声明与「本轮不许调用」是两件事，
+# 且上游实测对 tools+none 返回纯文本、不报 400。若某天上游不再遵守 none（参考项目
+# wb 的上游就有此现象：保留 tools 后仍回 tool_calls），设 QD_TOOLCHOICE_NONE_DROPS_TOOLS=1
+# 可一键回到「连 tools 一起删」的旧行为，无需改代码发版。
+TOOLCHOICE_NONE_DROPS_TOOLS = os.environ.get(
+    "QD_TOOLCHOICE_NONE_DROPS_TOOLS", "0").lower() in ("1", "true", "yes", "on")
+
+
 def normalize_tool_choice(obj):
     """把 OpenAI tool_choice 归一成上游可接受的形态（避免 400）。"""
     if "tool_choice" not in obj:
@@ -2552,14 +2611,22 @@ def normalize_tool_choice(obj):
     if isinstance(tc, str):
         val = tc.strip().lower()
         if val == "none":
-            obj.pop("tool_choice", None)
-            obj.pop("tools", None)
+            if TOOLCHOICE_NONE_DROPS_TOOLS:
+                obj.pop("tool_choice", None)
+                obj.pop("tools", None)
+            else:
+                # 保留 tools 声明，只把「本轮不许调用」写在 tool_choice 上（上游只认字符串）
+                obj["tool_choice"] = "none"
         return
     if isinstance(tc, dict):
         typ = (tc.get("type") or "").strip().lower()
         if typ == "none":
-            obj.pop("tool_choice", None)
-            obj.pop("tools", None)
+            if TOOLCHOICE_NONE_DROPS_TOOLS:
+                obj.pop("tool_choice", None)
+                obj.pop("tools", None)
+            else:
+                # 对象形式降级为字符串 "none"（与 auto/required 的既有降级风格一致）
+                obj["tool_choice"] = "none"
         elif typ in ("auto", "required"):
             obj["tool_choice"] = typ
         elif typ == "function":
@@ -3481,8 +3548,16 @@ def build_qoder_body(payload, account, model_key, realm=None):
     model = payload.get("model") or ""
     messages = backfill_reasoning_content(messages, model, model_key)
 
-    use_structured = structured_tool_history_enabled(
-        model=model, model_key=model_key, realm=r, messages=messages)
+    # 形态决策**单点**（设计文档 §0 原则①）：Anthropic 等新入口会把决定好的
+    # 结果放在 payload["_qd_structured"] 里下传，这里优先采信它；只有 chat 主链路
+    # （不带该键）才在本函数内自行判定。两处各判一次会导致「桥接层以为结构化、
+    # flatten 却走文本化」的错配，症状正是客户端收到信封文本。
+    use_structured = payload.get("_qd_structured")
+    if use_structured is None:
+        use_structured = structured_tool_history_enabled(
+            model=model, model_key=model_key, realm=r, messages=messages)
+    else:
+        use_structured = bool(use_structured)
     system_text, flat, images = flatten_messages(
         messages, keep_reasoning=is_deepseek_model(model, model_key),
         structured=use_structured)
@@ -5548,6 +5623,11 @@ class Handler(BaseHTTPRequestHandler):
             "Bearer ").strip()
         if supplied:
             return supplied
+        # Anthropic 客户端（Claude Code 等）用 x-api-key 头，而不是
+        # Authorization: Bearer —— 漏掉这一路回退会让 /v1/messages 全量 401。
+        anthropic_key = (self.headers.get("x-api-key") or "").strip()
+        if anthropic_key:
+            return anthropic_key
         # 浏览器顶层导航无法设置头，所以 ?key= 也接受（看板跨设备打开用）。
         try:
             query = parse_qs(urlparse(self.path).query)
@@ -5592,6 +5672,36 @@ class Handler(BaseHTTPRequestHandler):
         return ("模型 %s 只在%s提供，但「%s」绑定的是%s出口。"
                 "请改用对应出口的 Key，或把该 Key 的出口改为「跟随面板切换」。"
                 % (model, served, name, used))
+
+    def _banned_model_error(self, model):
+        """P1-4 全局封禁：命中即返回文案（不碰上游、不扣任何点数）。"""
+        if not is_model_banned(model):
+            return ""
+        return banned_model_message(model)
+
+    def _key_model_error(self, model):
+        """P1-4 每 Key 模型白名单：在请求到达上游之前拒绝。
+
+        未设 models 的 Key 不受限（空列表 = 不限制），因此这是 no-op，
+        除非管理员显式配置了限制。
+        """
+        entry = getattr(self, "key_entry", None)
+        if not entry:
+            return ""
+        if qoder_settings.key_allows_model(entry, model):
+            return ""
+        return key_model_message(entry, model)
+
+    def _model_precheck(self, model, realm):
+        """模型级前置拒绝（统一落点，全部在 open_upstream 之前）。
+
+        顺序：跨区错配[既有] -> 全局封禁[P1-4] -> Key 白名单[P1-4]。
+        三处请求入口（chat / responses / anthropic messages）**共用本方法**——
+        新增入口必须一并挂上，否则会出现「chat 被拦、别的协议绕过」的缺口。
+        """
+        return (self._cross_realm_error(model, realm)
+                or self._banned_model_error(model)
+                or self._key_model_error(model))
 
     def _request_realm(self, explicit=None):
         """Pick the upstream exit for this request.
@@ -6055,9 +6165,16 @@ class Handler(BaseHTTPRequestHandler):
                     "realm": realm,
                     "enabled": item.get("enabled", True) is not False,
                     "created_at": created_at,
+                    # P1-4：每 Key 模型白名单（原样透传；规范化统一在
+                    # qoder_settings._clean_key_entry 一处完成）。
+                    "models": item.get("models"),
                 })
             qoder_settings.set_api_keys(ACCOUNTS_DIR, cleaned)
             reply["api_keys_saved"] = len(cleaned)
+        if "banned_models" in payload:
+            # P1-4：全局封禁列表（逗号/分号/换行分隔均可，清洗在 qoder_settings）。
+            reply["banned_models"] = qoder_settings.set_banned_models(
+                ACCOUNTS_DIR, payload.get("banned_models"))
         if "auth_disabled" in payload:
             qoder_settings.set_auth_disabled(ACCOUNTS_DIR,
                                              payload.get("auth_disabled"))
@@ -6528,6 +6645,153 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "unknown account endpoint",
                            "invalid_request_error")
 
+    def _handle_anthropic(self, path, payload):
+        """Anthropic /v1/messages（task-78 接线；设计文档 .team/72-ANTHROPIC-BRIDGE-DESIGN.md §7）。
+
+        三条易错点逐条落地：
+          1) 形态决策**只算一次**（写进 chat_req["_qd_structured"] 下传）；
+          2) 流式守卫链与 chat 链逐字一致，allowed_names 取**转换后的 chat_req**；
+          3) 出站只做协议翻译，不在本层重写吞掉/回读。
+        能力差异（有意）：流式**不做流内信封重开** —— Anthropic 客户端对重复
+        message_start 的容忍度未知，宁可给明确的 event: error 收尾；非流式仍走
+        aggregate_with_envelope_retry（此时尚未向客户端写任何字节，重试安全）。
+        """
+        if path.endswith("/count_tokens"):
+            # 纯本地估算：**不发上游**（判据 4）
+            return self._json(
+                200, qoder_anthropic.estimate_anthropic_tokens(payload))
+        ok, problem = qoder_anthropic.validate_request(payload)
+        if not ok:
+            return self._error(400, problem, "invalid_request_error")
+        chat_req = qoder_anthropic.messages_to_chat(payload)
+        model = chat_req.get("model") or payload.get("model") or "auto"
+        want_stream = bool(payload.get("stream"))
+        session_key = extract_session_key(self.headers, chat_req)
+        fp = prompt_fingerprint(chat_req.get("messages"))
+        t_start = time.time()
+        req_realm = self._request_realm() or CURRENT_REALM
+        model_key = qoder_catalog.resolve_upstream_key(model, realm=req_realm)
+        # ---- 形态决策单点：在这里算唯一一次，随 chat_req 下传 ----
+        chat_req["_qd_structured"] = structured_tool_history_enabled(
+            model=model, model_key=model_key, realm=req_realm,
+            messages=chat_req.get("messages"))
+        holder = {"usage": None,
+                  "allowed_names": _tool_names_from_payload(chat_req)}
+        log("anthropic: model=%s stream=%s msgs=%d effort=%r structured=%s"
+            % (model, want_stream, len(chat_req.get("messages") or []),
+               chat_req.get("reasoning_effort"),
+               bool(chat_req.get("_qd_structured"))))
+        try:
+            usage_ctx = {}
+            blocked = self._model_precheck(chat_req.get("model"), req_realm)
+            if blocked:
+                return self._error(400, blocked, "invalid_request_error")
+            upstream, account, _ = open_upstream(
+                chat_req, session_key=session_key, target_realm=req_realm,
+                usage_ctx=usage_ctx)
+        except RateLimited as exc:
+            record_error(model, 429, exc.detail[:200],
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            return self._rate_limited(exc)
+        except urllib.error.HTTPError as exc:
+            detail = getattr(exc, "qoder_detail", "")
+            if not detail:
+                try:
+                    detail = exc.read(600).decode("utf-8", "replace")
+                except Exception:
+                    detail = ""
+            record_error(model, exc.code, detail,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            msg, etype = friendly_upstream_error(exc.code, detail)
+            return self._error(exc.code, msg, etype)
+        except Exception as exc:
+            message = str(exc)
+            record_error(model, 502, message,
+                         elapsed_ms=int((time.time() - t_start) * 1000))
+            if message.startswith("no usable account"):
+                return self._error(503, message
+                                   + " - add or enable one at the dashboard (/)")
+            return self._error(502, "upstream unreachable: %s" % exc)
+        with upstream:
+            if want_stream:
+                self._sse_begin()
+                first_ms = None
+                try:
+                    # 守卫链与 chat 主链路**逐字一致**（顺序与参数都不能改）：
+                    #   sse_with_heartbeat(recover_leaked_tool_calls(
+                    #       iter_inner_sse(...), allowed_names=...))
+                    # allowed_names 必须来自**转换后的 chat_req**；用 Anthropic
+                    # 原始 payload 会取不到工具名 -> 回读守卫失效 -> #9/#11 泄漏回归。
+                    inner = sse_with_heartbeat(
+                        recover_leaked_tool_calls(
+                            iter_inner_sse(upstream, holder=holder),
+                            allowed_names=_tool_names_from_payload(chat_req)),
+                        self._sse_write)
+                    for frame in qoder_anthropic.stream_anthropic_events(
+                            inner, model, holder):
+                        if first_ms is None:
+                            first_ms = int((time.time() - t_start) * 1000)
+                        self._sse_write(frame)
+                except (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError):
+                    wall = int((time.time() - t_start) * 1000)
+                    record_usage(model, holder.get("usage"), stream=True,
+                                 elapsed_ms=wall, ttft_ms=first_ms,
+                                 gen_ms=(wall - first_ms)
+                                 if first_ms is not None else None,
+                                 fp=fp, account=account.uid,
+                                 effort=usage_ctx.get("effort"),
+                                 effort_requested=usage_ctx.get("effort_requested"),
+                                 key_id=self._key_id_for_usage())
+                    return
+                except UpstreamStatus as exc:
+                    # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
+                    _handle_envelope_account_cooldown(account, exc, model=model,
+                                                      session_key=session_key)
+                    wall = int((time.time() - t_start) * 1000)
+                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    msg, _ = friendly_upstream_error(_to_int_status(exc.status),
+                                                     exc.detail)
+                    log("anthropic upstream status %s: %s"
+                        % (exc.status, msg[:200]), level="ERROR", tag="chat")
+                    self._sse_write(qoder_anthropic.anthropic_error_frame(msg))
+                    self._sse_end()
+                    return
+                self._sse_end()
+                wall = int((time.time() - t_start) * 1000)
+                record_usage(model, holder.get("usage"), stream=True,
+                             elapsed_ms=wall, ttft_ms=first_ms,
+                             gen_ms=(wall - first_ms)
+                             if first_ms is not None else None,
+                             fp=fp, account=account.uid,
+                             effort=usage_ctx.get("effort"),
+                             effort_requested=usage_ctx.get("effort_requested"),
+                             key_id=self._key_id_for_usage())
+                return
+            try:
+                chat_obj, account = aggregate_with_envelope_retry(
+                    upstream, chat_req, session_key, req_realm, model,
+                    holder, account)
+            except UpstreamStatus as exc:
+                record_error(model, exc.status, exc.detail,
+                             elapsed_ms=int((time.time() - t_start) * 1000))
+                msg, etype = friendly_upstream_error(_to_int_status(exc.status),
+                                                     exc.detail)
+                return self._error(
+                    exc.status if str(exc.status).isdigit() else 502, msg, etype)
+            except Exception as exc:
+                record_error(model, 502, str(exc),
+                             elapsed_ms=int((time.time() - t_start) * 1000))
+                return self._error(502, "upstream stream error: %s" % exc)
+            wall = int((time.time() - t_start) * 1000)
+            result = qoder_anthropic.chat_to_messages(chat_obj, model=model)
+            record_usage(model, chat_obj.get("usage"), stream=False,
+                         elapsed_ms=wall, fp=fp, account=account.uid,
+                         effort=usage_ctx.get("effort"),
+                         effort_requested=usage_ctx.get("effort_requested"),
+                         key_id=self._key_id_for_usage())
+            return self._json(200, result)
+
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
@@ -6546,7 +6810,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
-            blocked = self._cross_realm_error(chat_req.get("model"), req_realm)
+            blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(
@@ -6734,7 +6998,10 @@ class Handler(BaseHTTPRequestHandler):
         )
         if not is_account_route and path not in (
                 "/v1/chat/completions", "/chat/completions",
-                "/v1/responses", "/responses"):
+                "/v1/responses", "/responses",
+                # Anthropic Messages（task-78 接线）：两条都要进白名单，
+                # 否则会在 404 分支被拦掉（CORS 无需另加，"/v1" 前缀已覆盖）。
+                "/v1/messages", "/v1/messages/count_tokens"):
             if path in ("/v1/completions", "/completions"):
                 # legacy Completions（prompt 而非 messages）本网关不实现：
                 # 明确 404 优于"接受请求却按空会话转发上游"。
@@ -6754,6 +7021,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._handle_accounts(path, payload)
         if path in ("/v1/responses", "/responses"):
             return self._handle_responses(payload)
+        if path in ("/v1/messages", "/v1/messages/count_tokens"):
+            return self._handle_anthropic(path, payload)
 
         # ---- Chat Completions 主链路 ----
         normalize_tool_choice(payload)
@@ -6774,7 +7043,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             req_realm = self._request_realm() or CURRENT_REALM
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
-            blocked = self._cross_realm_error(model, req_realm)
+            blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
             upstream, account, _ = open_upstream(payload, session_key=session_key,

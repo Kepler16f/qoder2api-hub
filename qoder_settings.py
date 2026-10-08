@@ -7,10 +7,12 @@ password is never stored in clear text - only a PBKDF2-SHA256 digest.
 Only the Python standard library is required.
 """
 
+import fnmatch
 import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -167,6 +169,9 @@ def _clean_key_entry(entry):
         "realm": realm,
         "enabled": entry.get("enabled", True) is not False,
         "created_at": entry.get("created_at") or time.strftime("%Y/%m/%d %H:%M"),
+        # P1-4：每 Key 模型白名单（空列表 = 不限制）。**必须显式保留**——
+        # 本函数是白名单式重建，漏掉即「保存时被静默丢弃」（limits 同型坑）。
+        "models": _clean_model_patterns(entry.get("models")),
     }
 
 
@@ -260,6 +265,66 @@ def set_auth_disabled(accounts_dir, disabled):
         data = load(accounts_dir)
         data["auth_disabled"] = bool(disabled)
         save(accounts_dir, data)
+
+
+# ------------------------------------------------------------- model gates
+# P1-4：模型闸门配置层。全局封禁（banned_models）与每 Key 白名单（key 条目的
+# models 字段）共用同一套 pattern 清洗与匹配：fnmatch 通配、大小写不敏感；
+# **默认空 = 不封禁 / 不限制**（未碰这两个配置的安装行为与改动前一致）。
+_MODEL_SPLIT = re.compile(r"[,;\n]")
+
+
+def _clean_model_patterns(value):
+    """把 字符串 / 列表 / 集合 清洗成 pattern 列表（strip+lower+去重+去空）。
+
+    非法类型返回 []（fail-open：读配置永远不抛）。
+    """
+    if isinstance(value, str):
+        raw = _MODEL_SPLIT.split(value)
+    elif isinstance(value, (list, tuple, set)):
+        raw = list(value)
+    else:
+        return []
+    out = []
+    for item in raw:
+        pattern = str(item or "").strip().lower()
+        if pattern and pattern not in out:
+            out.append(pattern)
+    return out
+
+
+def key_allows_model(entry, model):
+    """True = 该 Key 未设模型限制，或 model 命中它的 models 列表。
+
+    - 空列表（或字段缺失）= 不受限（未碰过这个字段的安装行为不变）；
+    - 受限 Key 且 model 为空 = **拒绝**（wb 同语义：空模型没有可判定依据，
+      放行只会带着空模型白跑一趟上游）；
+    - 匹配 fnmatch（大小写已在清洗时统一为小写），支持 gpt-4* 这类通配。
+    """
+    patterns = _clean_model_patterns((entry or {}).get("models"))
+    if not patterns:
+        return True
+    name = str(model or "").strip().lower()
+    if not name:
+        return False
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
+
+
+def banned_models(accounts_dir):
+    """全局封禁的模型 pattern 列表（settings 键 banned_models；默认空）。"""
+    with _lock:
+        raw = load(accounts_dir).get("banned_models")
+    return _clean_model_patterns(raw)
+
+
+def set_banned_models(accounts_dir, value):
+    """落盘全局封禁列表（清洗后存储；空 = 不封禁任何模型）。返回清洗结果。"""
+    patterns = _clean_model_patterns(value)
+    with _lock:
+        data = load(accounts_dir)
+        data["banned_models"] = patterns
+        save(accounts_dir, data)
+    return patterns
 
 
 class PanelSessions(object):

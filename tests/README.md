@@ -83,3 +83,42 @@
    `[FAIL] checkinOutcome：earned=0 且无 claimed -> idle（不报签到成功）` + `[FAIL] checkinToastKind：全 idle -> warn` → RED exit 1；恢复后 GREEN exit 0。
 
    这三条都只动**备份副本**（`%TEMP%` 下先备份、跑完立即还原），原文件不留痕。
+
+## 迁移期纪律（每批迁移后都要过一遍）
+
+### 1. 路径：一律基于 `__file__`，绝不用 cwd
+
+套件在 `tests/` 下跑（`run_all.py` 就是 `cwd=tests/`），而仓根文件在上一层。
+**不要**用 `os.path.dirname(os.path.abspath(__file__))` 当仓库根 —— 那在 `_test_qoder.py`
+里成立（它就在仓根），搬进 `tests/` 就错了。统一用 `_suite_head.ROOT`：
+
+    _src = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+
+（第 2 批迁移的 `_test_offline_tools.py` 踩过这个，3 处已改；现已验证 `cwd=tests/` 与
+`cwd=仓根` 两种跑法都是 32/32 GREEN。）
+
+### 2. 依赖：段里用到的模块必须能在共享头部找到
+
+段落在 legacy 里可能靠「前面某段顺手 import」才拿到 `hashlib` 之类。独立成套件就会
+NameError。`_suite_head.py` 已把常用标准库（`base64/contextlib/hashlib/io/json/os/re/
+shutil/struct/sys/tarfile/tempfile/time`）全部模块级 import 并放进 `__all__`。
+
+### 3. 隔离：每个套件自己的临时目录、不共享模块级全局
+
+- 临时文件一律 `tempfile.mkdtemp(prefix="qd-<套件名>-")`，`finally` 里 `rmtree`；
+- 需要改模块级全局（`P.USAGE_LOG` / `P.POOL` / `P.API_KEY` …）时，**必须** try/finally 恢复；
+- **不要写仓库内的共享路径**（`usage/` / `accounts/` / `umid/`）—— 并发编排下那是跨进程共享的，
+  是最典型的「单跑绿、并发红」来源；
+- 需要独占某个全局资源的套件，可以单独串行跑：`QD_TESTS_JOBS=1 python tests/run_all.py`，
+  或 `python tests/run_all.py <套件名片段>`。
+
+### 4. 环境变量在并发下是安全的（但别依赖）
+
+`run_all.py` 每个套件跑在**独立子进程**里，所以 `os.environ[...]` 的读写不会跨套件串味。
+但**同一进程内**的多个断言互相影响仍要防（改完要恢复）。
+
+### 5. 「单跑绿、并发红」的排查顺序
+
+1. 先跑 `QD_TESTS_JOBS=1 python tests/run_all.py`（串行）—— 若串行也红，那是套件自身问题；
+2. 串行绿、并发红 → 查上面的第 3 条（共享路径/全局）；
+3. 还是找不到 → 跑两遍 `run_all.py` 对比日志（`<tmp>/qd-suites-*/`），看失败是否稳定复现。

@@ -14,17 +14,25 @@
 为什么要显式抽出：第一次迁移 [35]/[39] 时每个套件各自抄一遍头部，结果两份都漏了
 import（一份漏 json、一份漏 P）→ 两个套件直接 NameError 全红。共享模块从根上消掉这类抄漏。
 """
+import base64
+import contextlib
+import hashlib
+import io
 import json
 import os
+import re
 import shutil
+import struct
 import sys
+import tarfile
 import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PASS = FAIL = SKIP = 0
 
-__all__ = ["json", "os", "shutil", "sys", "tempfile", "time", "ROOT",
+__all__ = ["base64", "contextlib", "hashlib", "io", "json", "os", "re", "shutil",
+           "struct", "sys", "tarfile", "tempfile", "time", "ROOT",
            "bootstrap", "check", "skip", "finish", "PASS", "FAIL", "SKIP"]
 
 

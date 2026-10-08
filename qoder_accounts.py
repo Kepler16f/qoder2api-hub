@@ -3150,6 +3150,9 @@ class AccountPool(object):
         })
         url = cfg["openapi"] + PATH_DEVICE_POLL + "?" + q
         validate_public_http_url(url)
+        # task-80 判定：本调用**不带账号凭证**（device flow 的 nonce/verifier
+        # challenge，无 Authorization），且依赖原始 HTTPError 语义
+        # （404/202 = 尚未授权 -> pending）——**故意保留直连**，不收口。
         req = urllib.request.Request(url, method="GET", headers={
             "Accept": "application/json",
             "User-Agent": "QoderWork",
@@ -3185,14 +3188,16 @@ class AccountPool(object):
         # 拉取 userinfo 补全昵称/用户类型（尽力而为，不阻塞入库）
         try:
             ui_url = cfg["openapi"] + PATH_USERINFO
-            validate_public_http_url(ui_url)
-            req_ui = urllib.request.Request(ui_url, method="GET", headers={
+            # task-80 收口（P1-2 第一步）：本调用**携带账号凭证**
+            # （Authorization: Bearer <token>），必须走统一出站函数 http_json
+            # ——它是「所有带凭证调用都过同一出口」的唯一保证点（未来若上
+            # 出站代理/审计，自动覆盖）。语义保持：retries=1（原实现单次）、
+            # URL 校验由 http_json 内部执行、失败仍由外层 except 兜底。
+            ui = http_json(ui_url, method="GET", headers={
                 "Accept": "application/json",
                 "User-Agent": CLIENT_UA,
                 "Authorization": "Bearer " + token,
-            })
-            with urllib.request.urlopen(req_ui, timeout=15) as resp_ui:
-                ui = json.loads(resp_ui.read().decode("utf-8"))
+            }, timeout=15, retries=1)
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
