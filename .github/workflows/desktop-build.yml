@@ -71,7 +71,11 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ]; then
             python -m pip install pywebview          # WKWebView 后端（pyobjc 随装）
           elif [ "${{ runner.os }}" = "Linux" ]; then
-            python -m pip install pywebview PyGObject  # GTK/WebKit2GTK 后端（系统库不进包）
+            # PyGObject 钉 3.50：3.51+ 要求 girepository-2.0 开发库（22.04 无），
+            # 3.50 走 1.0 API；dev 头文件供无轮子时源码构建。
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libgirepository1.0-dev pkg-config
+            python -m pip install pywebview "PyGObject==3.50.0"
           fi
           # Windows 不需要任何 GUI 依赖：tkinter 内置 + WebView2 宿主为纯 ctypes
 
