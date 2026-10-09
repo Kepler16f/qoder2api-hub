@@ -4316,13 +4316,12 @@ def friendly_upstream_error(code, detail):
                 "约 %d 秒后可用，请稍后重试（换模型或换区域可立即绕开）。"
                 "上游详情：%s" % (qw, detail[:200]),
                 "upstream_queued")
-    # 3) 上游付费墙（112：Free 计划被拒推理；与 credits 余额无关）
+    # 3) 上游付费墙（112：该**模型**对 Free 计划收费；与 credits 余额无关）
     if code_i == 403 and _is_paid_wall(detail):
-        return ("上游拒绝为 Free 计划提供推理 (HTTP 403/112)：与剩余额度无关。"
-                "多为上游高峰期限流或免费层政策调整（实测同日 15-19 点正常、"
-                "19 点后切换），网关每小时自动重试；持续多日不恢复则需订阅"
-                " qoder.com/pricing 或改用国内版账号。上游详情：%s"
-                % detail[:200],
+        return ("该模型对 Free 计划收费 (HTTP 403/112)：与账号剩余额度无关"
+                "（auto/GLM/DeepSeek 等收费，Qwen3.8-Flash 等仍开放）。"
+                "换用 Flash 级模型即可绕开；持续需要收费模型则需订阅"
+                " qoder.com/pricing。上游详情：%s" % detail[:200],
                 "upstream_paid_wall")
     if _is_transient_upstream(code_i, detail) or (
             "provider_error" in detail and "invalid_" not in detail):
@@ -4368,7 +4367,8 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         schedule_auto_refresh(account, "envelope 429")
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
-        # 10605 排队冷却为模型级或账号级；112 付费墙是计划层持久状态
+        # 10605 排队与 112 付费墙都是**模型级**信号（同账号同刻可复现
+        # auto=112 而 qfmodel=10605 排队），冷却挂在 model 上、不拉黑账号
         is_queue = "10605" in detail or "isQueued" in detail
         is_paid = _is_paid_wall(detail)
         if is_paid:
@@ -4379,7 +4379,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             cd = retry_secs if is_queue else 60
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=cd, single_account=(total <= 1),
-                           model=model if is_queue else None)
+                           model=model if (is_queue or is_paid) else None)
         log("account %s rejected via envelope (HTTP %s, queue=%s, paidwall=%s), cooling for %ds and rotating"
             % (account.uid[:8], status_int, is_queue, is_paid, cd), level="WARN", tag="chat")
         if dead:
@@ -4683,18 +4683,19 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                     last_error = exc
                     continue
                 if exc.code == 403 and _is_paid_wall(detail):
-                    # 112 付费墙：Free 计划被拒推理（计划层持久状态，与
-                    # credits 无关）——长冷却 1 小时、不刷 token；换号继续
-                    # （池里可能有已付费账号）
+                    # 112 付费墙：**模型级**——auto/GLM/DeepSeek 等对 Free 计划
+                    # 收费，Qwen3.8-Flash 等仍开放（实测同账号同刻：auto=112、
+                    # qfmodel=10605 排队）。模型冷却 1 小时、不刷 token、不拉黑
+                    # 整个账号（它用其他模型还能干活）、换号继续探池
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
                     account.note_error(
-                        "paid wall (HTTP 403/112): Free plan, inference "
-                        "requires a paid subscription", cooldown=3600,
-                        single_account=(total <= 1))
-                    log("account %s hits paid wall (112) - Free plan rejected, "
-                        "cooling 1h, rotating" % account.uid[:8],
-                        level="WARN", tag="chat")
+                        "model paywalled (HTTP 403/112): Free plan, model "
+                        "requires paid subscription", model=model,
+                        cooldown=3600, single_account=(total <= 1))
+                    log("account %s model paywalled (112) on '%s' - model "
+                        "cooldown 1h, rotating"
+                        % (account.uid[:8], model), level="WARN", tag="chat")
                     last_error = exc
                     continue
                 log("account %s rejected (HTTP %s), rotating"
@@ -7142,71 +7143,108 @@ class Handler(BaseHTTPRequestHandler):
             if not account:
                 return self._error(404, "no such account")
             test_model = payload.get("model") or "auto"
-            test_payload = {
-                "model": test_model,
-                "messages": [{"role": "user", "content": "hi"}],
-                "stream": False,
-            }
+
+            def _try_model(model):
+                """跑一次最小 chat；返回 (ok, reply, exc, wall_ms)。"""
+                t = time.time()
+                try:
+                    resp, acc, _ = open_upstream(
+                        {"model": model,
+                         "messages": [{"role": "user", "content": "hi"}],
+                         "stream": False},
+                        target_realm=acc_realm(account))
+                    with resp:
+                        chat_obj = aggregate_stream(resp, model, None)
+                    choices = chat_obj.get("choices") or []
+                    msg = (choices[0].get("message") or {}) if choices else {}
+                    reply = (msg.get("content") or msg.get("reasoning_content")
+                             or "OK").strip()
+                    if len(reply) > 80:
+                        reply = reply[:77] + "..."
+                    return True, reply, None, int((time.time() - t) * 1000)
+                except Exception as exc:
+                    return False, "", exc, int((time.time() - t) * 1000)
+
             t0 = time.time()
-            try:
-                resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
-                with resp:
-                    chat_obj = aggregate_stream(resp, test_model, None)
-                wall_ms = int((time.time() - t0) * 1000)
-                choices = chat_obj.get("choices") or []
-                msg = (choices[0].get("message") or {}) if choices else {}
-                reply_text = (msg.get("content") or msg.get("reasoning_content")
-                              or "OK").strip()
-                if len(reply_text) > 80:
-                    reply_text = reply_text[:77] + "..."
+            ok, reply_text, exc, wall_ms = _try_model(test_model)
+            paywalled_note = ""
+            if not ok and test_model == "auto" \
+                    and _is_paid_wall(getattr(exc, "detail", "") or ""):
+                # 112 是模型级付费墙（auto/GLM/DeepSeek 对 Free 收费，
+                # Qwen3.8-Flash 等仍开放）——账号本身没坏，换 Flash 级
+                # 备选模型重测，避免"auto 需付费"被误报成账号失效
+                alt = None
+                try:
+                    for m in qoder_catalog.models_for_realm(
+                            acc_realm(account)):
+                        if "Flash" in (m.get("display_name") or ""):
+                            alt = m.get("display_name") or m.get("key")
+                            break
+                except Exception:
+                    alt = None
+                if alt and alt != test_model:
+                    ok2, reply2, exc2, wall2 = _try_model(alt)
+                    if ok2:
+                        ok, reply_text, exc = True, reply2, None
+                        wall_ms = int((time.time() - t0) * 1000)
+                        paywalled_note = ("（auto 对 Free 计划收费，已改用 %s "
+                                          "验证通过）" % alt)
+                    else:
+                        exc = exc2
+                        wall_ms = int((time.time() - t0) * 1000)
+            if ok:
                 account.clear_error()
-                log("account test: uid=%s model=%s wall=%dms ok=True"
-                    % (account.uid[:8], test_model, wall_ms), tag="accounts")
+                log("account test: uid=%s model=%s wall=%dms ok=True%s"
+                    % (account.uid[:8], test_model, wall_ms, paywalled_note),
+                    tag="accounts")
                 return self._json(200, {"ok": True, "uid": account.uid,
                                         "model": test_model,
+                                        "note": paywalled_note or None,
                                         "elapsed_ms": wall_ms,
                                         "reply": reply_text})
-            except RateLimited as exc:
-                wall_ms = int((time.time() - t0) * 1000)
+            if isinstance(exc, RateLimited) \
+                    and "queued" in (exc.detail or ""):
+                # 10605 排队：请求已被上游接受进队列——凭证与权益均有效，
+                # 只是模型容量暂时不足；账号测试视为通过
+                account.clear_error()
+                log("account test: uid=%s model=%s ok=True (queued)"
+                    % (account.uid[:8], test_model), tag="accounts")
+                return self._json(200, {"ok": True, "uid": account.uid,
+                                        "model": test_model,
+                                        "note": "模型排队中 (10605)，账号有效",
+                                        "elapsed_ms": wall_ms,
+                                        "reply": "(模型排队中，稍后可用)"})
+            # 失败路径：exc 已由 _try_model / 备选重测给出
+            wall_ms = int((time.time() - t0) * 1000)
+            if isinstance(exc, RateLimited):
                 return self._json(200, {"ok": False, "uid": account.uid,
                                         "status": 429,
-                                        "error": "rate limited: %s" % exc.detail[:150],
+                                        "error": "rate limited: %s"
+                                                 % exc.detail[:150],
                                         "elapsed_ms": wall_ms})
-            except urllib.error.HTTPError as exc:
-                wall_ms = int((time.time() - t0) * 1000)
+            if isinstance(exc, UpstreamStatus):
+                msg, _et = friendly_upstream_error(
+                    _to_int_status(exc.status), exc.detail)
+                shown = msg
+                status = _to_int_status(exc.status)
+            else:
+                shown = str(exc)
+                status = 500
                 try:
                     detail = exc.read(400).decode("utf-8", "replace")
+                    if detail:
+                        shown = "HTTP %s: %s" % (exc.code, detail[:150])
+                        status = exc.code
                 except Exception:
-                    detail = ""
-                account.note_error("HTTP %d: %s" % (exc.code, detail[:80]),
-                                   cooldown=60)
-                log("account test: uid=%s model=%s wall=%dms error=%d"
-                    % (account.uid[:8], test_model, wall_ms, exc.code),
-                    level="WARN", tag="accounts")
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": exc.code,
-                                        "error": "HTTP %d: %s"
-                                        % (exc.code, detail[:150]),
-                                        "elapsed_ms": wall_ms})
-            except Exception as exc:
-                wall_ms = int((time.time() - t0) * 1000)
-                # UpstreamStatus（信封 403 等）的 str 只有状态码——把 detail
-                # 过 friendly_upstream_error，付费墙/排队等才有可读结论
-                if isinstance(exc, UpstreamStatus):
-                    msg, _et = friendly_upstream_error(
-                        _to_int_status(exc.status), exc.detail)
-                    shown = msg
-                else:
-                    shown = str(exc)
-                account.note_error(shown[:120], cooldown=60)
-                log("account test: uid=%s model=%s wall=%dms exc=%s"
-                    % (account.uid[:8], test_model, wall_ms, shown[:160]),
-                    level="WARN", tag="accounts")
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": _to_int_status(
-                                            getattr(exc, "status", 500)),
-                                        "error": shown[:400],
-                                        "elapsed_ms": wall_ms})
+                    pass
+            account.note_error(shown[:120], cooldown=60)
+            log("account test: uid=%s model=%s wall=%dms exc=%s"
+                % (account.uid[:8], test_model, wall_ms, shown[:160]),
+                level="WARN", tag="accounts")
+            return self._json(200, {"ok": False, "uid": account.uid,
+                                    "status": status,
+                                    "error": shown[:400],
+                                    "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:

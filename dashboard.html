@@ -2961,6 +2961,7 @@ async function startDashboard(){
     setInterval(refresh, 5000),
     setInterval(loadSchedulerStatus, 30000),
     setInterval(loadAccounts, 15000),
+    setInterval(watchLanIpChange, 10000),
   ];
 }
 
@@ -3016,6 +3017,8 @@ async function loadSettings(showToast){
    开关走 /settings/save {lan_mode}：网关持久化并运行时重绑监听地址；
    调用样例里的 Key 默认打码，「显示完整 Key」经 /settings/reveal?id=gateway。 */
 let LAN_SAMPLE = {ip: '', port: '', key: ''};
+let LAN_ON = false;        // 当前局域网可见状态（renderLanSection 维护）
+let LAN_LAST_IPS = '';     // 上次渲染的 IP 列表签名，IP 变化检测用
 function lanSampleModel(){
   try {
     const list = (MODELS_DATA && MODELS_DATA.length) ? MODELS_DATA
@@ -3039,14 +3042,16 @@ function renderLanSection(data){
   const state = document.getElementById('setLanState');
   const info = document.getElementById('lanInfo');
   const on = !!data.lan_mode;
+  LAN_ON = on;
   if(toggle && toggle.checked !== on) toggle.checked = on;
   if(state){
     state.textContent = on ? '(已开启)' : '(仅本机)';
     state.style.color = on ? 'var(--accent2)' : 'var(--dim)';
   }
   if(info) info.style.display = on ? '' : 'none';
-  if(!on) return;
+  if(!on){ LAN_LAST_IPS = ''; return; }
   const ips = (data.lan_ips && data.lan_ips.length) ? data.lan_ips : ['<本机IP>'];
+  LAN_LAST_IPS = ips.join('|');
   const port = data.bind_port || (location.port || '8790');
   const set = (id, value) => { const el = document.getElementById(id); if(el) el.textContent = value || '-'; };
   set('setLanIps', ips.join('  /  '));
@@ -3095,6 +3100,23 @@ async function revealLanKey(btn){
   } catch(e) {
     toast(e.message || '需要先修改面板密码才能查看明文 Key', 'bad');
   }
+}
+/* 局域网 IP 变化监视：DHCP 重新分配 / WiFi 漫游到别的 AP 后，设置页展示的
+   调用地址会过期（下游照旧地址连就是无限挂起）。开着局域网可见时定期比对
+   /settings 里的 IP 列表，变了就重渲染样例并提示。IP 未变时不碰 DOM，
+   「显示完整 Key」的明文样例不会被周期性刷掉。 */
+async function watchLanIpChange(){
+  if(!PANEL_READY || !LAN_ON) return;
+  try {
+    const data = await getJSON('/settings');
+    if(!data || !data.lan_mode) return;
+    const ips = (data.lan_ips || []).join('|');
+    if(ips && ips !== LAN_LAST_IPS){
+      const hadBefore = !!LAN_LAST_IPS;
+      renderLanSection(data);
+      if(hadBefore) toast('本机局域网 IP 已变化，调用地址已更新', 'warn');
+    }
+  } catch(e) { /* 会话失效等：静默，等下次 loadSettings 重建 */ }
 }
 
 async function savePanelPassword(btn){

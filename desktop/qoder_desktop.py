@@ -66,7 +66,7 @@ try:
 except Exception:
     trayicon = None
 try:
-    import webview as _pywebview    # macOS：WKWebView
+    import webview as _pywebview    # macOS: WKWebView；Linux: GTK/WebKit2GTK
 except Exception:
     _pywebview = None
 try:
@@ -1387,7 +1387,7 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
 
 
 # ---------------------------------------------------------------------------
-# UI 2：macOS —— pywebview（WKWebView）
+# UI 2：pywebview 壳（macOS WKWebView / Linux GTK+WebKit2GTK）
 # ---------------------------------------------------------------------------
 def _inject_scrollbar_css(window):
     """pywebview 壳的滚动条隐藏：load 完成后注入 CSS（无初始脚本机制）。"""
@@ -1400,7 +1400,9 @@ def _inject_scrollbar_css(window):
     threading.Thread(target=_run, daemon=True).start()
 
 
-def run_mac_shell(state, cfg, config_path, paths, auto_close_ms=None):
+def run_webview_shell(state, cfg, config_path, paths, auto_close_ms=None):
+    """pywebview 跨平台壳：macOS 走 WKWebView，Linux 走 GTK/WebKit2GTK
+    （系统库，不进包——Linux deb 因此从 ~193MB 缩到 ~20MB 量级）。"""
     if _pywebview is None:
         raise RuntimeError("pywebview unavailable")
     webview = _pywebview
@@ -1486,7 +1488,7 @@ class _MacBridge(object):
 
 
 # ---------------------------------------------------------------------------
-# UI 3：Linux —— PySide6 + QtWebEngine
+# UI 3：Linux 源码后备 —— PySide6 + QtWebEngine（冻结包不打包）
 # ---------------------------------------------------------------------------
 def run_linux_shell(state, cfg, config_path, paths, auto_close_ms=None):
     if QWebEngineView is None:
@@ -1930,9 +1932,14 @@ def preferred_shell():
     if sys.platform == "win32" and webview2_host is not None:
         return run_windows_shell
     if sys.platform == "darwin" and _pywebview is not None:
-        return run_mac_shell
-    if sys.platform.startswith("linux") and QWebEngineView is not None:
-        return run_linux_shell
+        return run_webview_shell
+    # Linux 优先 pywebview（GTK/WebKit2GTK 系统库，冻结包不带 Qt 树）；
+    # PySide6/QtWebEngine 保留为源码运行模式的后备（冻结包不再打包它）。
+    if sys.platform.startswith("linux"):
+        if _pywebview is not None:
+            return run_webview_shell
+        if QWebEngineView is not None:
+            return run_linux_shell
     return None
 
 

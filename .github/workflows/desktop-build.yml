@@ -5,8 +5,8 @@ name: Desktop builds
 #   windows-11-arm   → Qoder2API-Hub-setup-windows-arm64.exe （原生 WOA，Inno 6.7 的
 #                                                       安装器本体为 x86，WOA 仿真可跑）
 #   macos-14         → Qoder2API-Hub-macos-arm64.dmg         （ad-hoc 签名 + DMG）
-#   ubuntu-22.04     → qoder2api-hub-linux-x64.deb           （QtWebEngine 内嵌）
-#   ubuntu-24.04-arm → qoder2api-hub-linux-arm64.deb         （glibc≥2.39）
+#   ubuntu-22.04     → qoder2api-hub-linux-x64.deb           （pywebview+WebKit2GTK）
+#   ubuntu-24.04-arm → qoder2api-hub-linux-arm64.deb         （同上，系统库不进包）
 #
 # GUI 不在 CI 里自动化（无显示服务器），每条产线以 --smoke-test 无头冒烟为准；
 # GUI/深色模式/安装卸载链路已在 WOA 真机人工验证。
@@ -71,7 +71,7 @@ jobs:
           if [ "${{ runner.os }}" = "macOS" ]; then
             python -m pip install pywebview          # WKWebView 后端（pyobjc 随装）
           elif [ "${{ runner.os }}" = "Linux" ]; then
-            python -m pip install PySide6            # QtWebEngine 内嵌
+            python -m pip install pywebview PyGObject  # GTK/WebKit2GTK 后端（系统库不进包）
           fi
           # Windows 不需要任何 GUI 依赖：tkinter 内置 + WebView2 宿主为纯 ctypes
 
@@ -105,6 +105,14 @@ jobs:
           fi
           "$BIN" --smoke-test --port 8799
           echo "smoke exit=$?"
+          # Linux：GUI 整链冒烟（pywebview -> PyGObject -> GTK -> WebKit2GTK）。
+          # xvfb 提供无头显示；webkit2gtk 是运行期系统依赖（构建机装它只为冒烟）。
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq xvfb gir1.2-webkit2-4.1 gir1.2-gtk-3.0               || sudo apt-get install -y -qq xvfb gir1.2-webkit2-4.0 gir1.2-gtk-3.0
+            xvfb-run -a "$BIN" --smoke-gui --auto-close-ms 20000
+            echo "gui smoke exit=$?"
+          fi
 
       # ---------------- 安装包 ----------------
       - name: Version string
@@ -188,11 +196,12 @@ jobs:
           Priority: optional
           Architecture: $DEBARCH
           Maintainer: Kepler16f
-          Depends: libgl1, libegl1, libxkbcommon0, libdbus-1-3, libfontconfig1
+          Depends: libgtk-3-0, gir1.2-gtk-3.0, gir1.2-webkit2-4.1 | gir1.2-webkit2-4.0
           Description: Qoder2API-Hub 桌面客户端（内嵌看板的 OpenAI 兼容网关）
            安装到 /opt/qoder2api-hub；数据目录在 $HOME/.local/share/qoder2api-hub
-           （安装目录只读时桌面壳自动回退）。Linux ARM64 内嵌 UI 需
-           glibc >= 2.39（Ubuntu 24.04+ 等新发行版；旧发行版自动回退控制台模式）。
+           （安装目录只读时桌面壳自动回退）。内嵌 UI 用系统 WebKit2GTK
+           （Ubuntu 22.04 为 4.0、24.04+ 为 4.1，Depends 已声明两者）；
+           缺依赖时自动回退控制台模式。
           EOF
           dpkg-deb --build --root-owner-group "$ROOT" \
             "qoder2api-hub-linux-${PKGARCH}.deb"

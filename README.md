@@ -74,8 +74,8 @@
 | `Qoder2API-Hub-setup-windows-x64.exe` | Windows 10/11 x64（按用户安装，无需管理员） |
 | `Qoder2API-Hub-setup-windows-arm64.exe` | Windows on ARM（原生运行，非仿真） |
 | `Qoder2API-Hub-macos-arm64.dmg` | Apple Silicon Mac（拖进 Applications） |
-| `qoder2api-hub-linux-x64.deb` | 主流发行版 x64（`sudo dpkg -i`） |
-| `qoder2api-hub-linux-arm64.deb` | ARM64 Linux（Ubuntu 24.04+ 等） |
+| `qoder2api-hub-linux-x64.deb` | 主流发行版 x64（内嵌用系统 WebKit2GTK，`sudo dpkg -i` 自动装依赖） |
+| `qoder2api-hub-linux-arm64.deb` | ARM64 Linux（同上） |
 
 - 首次打开看板的面板密码是 `admin`，请立即在「设置」页修改；
 - 托盘与开机自启开关在看板「设置」页的**「桌面客户端」区块**内（仅内嵌壳

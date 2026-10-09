@@ -12,8 +12,7 @@
 | Windows x64 | tkinter + **WebView2 原生嵌入**（`webview2_host.py`，纯标准库 ctypes 手写 COM） | Win10/11 自带 Evergreen WebView2 运行时 |
 | Windows ARM64 | 同上，**原生运行**（不用仿真） | clr_loader/pythonnet 不支持 arm64，QtWebEngine 无 win-arm64 构建，故自研 ctypes 宿主；WebView2 加载器按进程架构选 arm64/x64 |
 | macOS Apple Silicon | **pywebview**（WKWebView，系统自带） | pip 纯轮子（pyobjc），无系统依赖 |
-| Linux x64 | **PySide6 + QtWebEngine** | 要求 glibc ≥ 2.28（Ubuntu 20.04+ 等） |
-| Linux ARM64 | 同上 | 要求 glibc ≥ 2.39（Ubuntu 24.04+ 等新发行版） |
+| Linux x64 / ARM64 | **pywebview**（GTK + WebKit2GTK 系统库） | deb 声明依赖（22.04 为 4.0、24.04+ 为 4.1）；缺依赖自动回退控制台。源码模式装 PySide6 可用 QtWebEngine 后备 |
 | 任意平台兜底 | tkinter 控制台 + 浏览器打开看板 | `--ui console` 可强制；日志面板/端口/LAN/Key 复制齐全 |
 
 ## 下载与使用

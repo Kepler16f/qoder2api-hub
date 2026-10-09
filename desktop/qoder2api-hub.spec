@@ -55,10 +55,13 @@ else:
 onefile = sys.platform != "darwin"
 
 # pywebview 按平台在运行期动态 import 后端，PyInstaller 静态分析看不到，
-# 需要显式声明（Linux 走 PySide6 不用 pywebview；Windows 走自研 WebView2 宿主）。
+# 需要显式声明（Windows 走自研 WebView2 宿主不用 pywebview）。
 hiddenimports = []
 if sys.platform == "darwin":
     hiddenimports += ["webview.platforms.cocoa"]
+if sys.platform.startswith("linux"):
+    # GTK/WebKit2GTK 后端（系统库不进包，deb 体积因此 ~20MB 量级）
+    hiddenimports += ["webview.platforms.gtk"]
 
 a = Analysis(
     [os.path.join(HERE, "qoder_desktop.py")],
@@ -73,14 +76,10 @@ a = Analysis(
     noarchive=False,
 )
 
-# Linux：PySide6 hook 会把整棵 Qt 树塞进包（deb 因此 ~230MB）。按实际 ELF
-# 依赖闭包裁剪未用模块（3D/图表/多媒体/qml/多余 locale 与翻译）。
-# 实测归档体积 -25%，且 WebEngine 渲染链（Core/Process/ICU/locale）无损。
+# Linux 已改用 pywebview（GTK/WebKit2GTK 系统库），冻结包不再带 Qt 树，
+# prune_linux 的 ELF 闭包裁剪随之退役（git 历史可查）。strip 仍保留——
+# 对 PyGObject 等剩余 .so 仍有收益。
 strip_linux = sys.platform.startswith("linux")
-if strip_linux:
-    sys.path.insert(0, HERE)
-    import prune_linux
-    a.binaries = prune_linux.prune_binaries(a.binaries, log=print)
 
 pyz = PYZ(a.pure)
 
