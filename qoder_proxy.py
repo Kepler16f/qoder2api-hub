@@ -4536,8 +4536,31 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
 # ---------------------------------------------------------------------------
 # Responses API (/v1/responses) <-> Chat Completions translation
 # ---------------------------------------------------------------------------
+def _lan_ip_rank(ip):
+    """LAN 地址候选排序：真实局域网段在前，虚拟网卡/TUN 段在后。
+
+    Hyper-V/WSL/Docker 的虚拟交换机几乎总用 172.16-31.x；Clash TUN 的
+    fake-ip 用 198.18/19.x——照这些地址访问必然 fail to fetch。
+    """
+    try:
+        parts = [int(x) for x in ip.split(".")]
+    except Exception:
+        return 99
+    if ip.startswith("198.18.") or ip.startswith("198.19."):
+        return 90
+    if parts[0] == 172 and 16 <= parts[1] <= 31:
+        return 80
+    if parts[0] in (10, 192):
+        return 10
+    return 50
+
+
 def local_ip_addresses():
-    """Every non-loopback IPv4 address this machine answers on."""
+    """本机 LAN 地址候选，按可达性排序（默认路由出口最优先）。
+
+    getaddrinfo(主机名) 会把虚拟网卡（vEthernet/WSL）也列进来；UDP connect
+    8.8.8.8 拿到的默认路由源地址在无 TUN 时就是真实 LAN IP，排最前。
+    """
     found = []
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
@@ -4546,15 +4569,20 @@ def local_ip_addresses():
                 found.append(ip)
     except Exception:
         pass
-    if not found:
-        try:
-            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            probe.connect(("8.8.8.8", 80))
-            found.append(probe.getsockname()[0])
-            probe.close()
-        except Exception:
-            pass
-    return found
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        probe.connect(("8.8.8.8", 80))
+        probe_ip = probe.getsockname()[0]
+        probe.close()
+        if probe_ip and _lan_ip_rank(probe_ip) < 80:
+            if probe_ip in found:
+                found.remove(probe_ip)
+            found.insert(0, probe_ip)
+        elif probe_ip and probe_ip not in found:
+            found.append(probe_ip)
+    except Exception:
+        pass
+    return sorted(found, key=_lan_ip_rank)
 
 
 def _new_id(prefix):
