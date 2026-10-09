@@ -58,7 +58,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.9.8_re"
+VERSION = "2026.10.9.9_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4243,6 +4243,17 @@ def _queue_wait_seconds(detail):
         return 30
 
 
+def _is_paid_wall(detail):
+    """上游 112 付费墙信封（HTTP 403 + pricingUrl）：Free 计划被拒推理。
+
+    2026-10-09 实测：国际版对 Free 计划账号返回 403+code 112 并引导
+    qoder.com/pricing——与 credits 余额无关（余额 399/400 的账号同样被拒），
+    是计划层面的持久状态：刷 token/换号（若全池 Free）都无效。
+    """
+    d = str(detail or "")
+    return '"code":"112"' in d or '"code": "112"' in d or "pricingUrl" in d
+
+
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
 
@@ -4305,6 +4316,13 @@ def friendly_upstream_error(code, detail):
                 "约 %d 秒后可用，请稍后重试（换模型或换区域可立即绕开）。"
                 "上游详情：%s" % (qw, detail[:200]),
                 "upstream_queued")
+    # 3) 上游付费墙（112：Free 计划被拒推理；与 credits 余额无关）
+    if code_i == 403 and _is_paid_wall(detail):
+        return ("上游付费墙 (HTTP 403/112)：该账号为 Free 计划，上游已停止"
+                "对其提供推理服务（与剩余额度无关）。需到 "
+                "qoder.com/pricing 订阅付费计划，或改用其他已付费账号/"
+                "国内版账号。上游详情：%s" % detail[:200],
+                "upstream_paid_wall")
     if _is_transient_upstream(code_i, detail) or (
             "provider_error" in detail and "invalid_" not in detail):
         return ("上游瞬时故障 (HTTP %s)：网关已对同账号自动重试仍失败，"
@@ -4349,21 +4367,28 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         schedule_auto_refresh(account, "envelope 429")
     elif status_int in (401, 403):
         dead = qoder_accounts.session_dead(detail)
-        # 10605 排队冷却为模型级或账号级
+        # 10605 排队冷却为模型级或账号级；112 付费墙是计划层持久状态
         is_queue = "10605" in detail or "isQueued" in detail
-        cd = 300 if dead else (retry_secs if is_queue else 60)
+        is_paid = _is_paid_wall(detail)
+        if is_paid:
+            cd = 3600
+        elif dead:
+            cd = 300
+        else:
+            cd = retry_secs if is_queue else 60
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=cd, single_account=(total <= 1),
                            model=model if is_queue else None)
-        log("account %s rejected via envelope (HTTP %s, queue=%s), cooling for %ds and rotating"
-            % (account.uid[:8], status_int, is_queue, cd), level="WARN", tag="chat")
+        log("account %s rejected via envelope (HTTP %s, queue=%s, paidwall=%s), cooling for %ds and rotating"
+            % (account.uid[:8], status_int, is_queue, is_paid, cd), level="WARN", tag="chat")
         if dead:
             account.enabled = False
             account.save(ACCOUNTS_DIR) if account.path else None
             log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
                 % account.uid[:8], level="ERROR")
-        if not is_queue:
-            # 10605 排队是模型容量问题，token 没毛病——刷新是无效动作
+        if not is_queue and not is_paid:
+            # 10605 排队是模型容量问题、112 是计划问题——token 都没毛病，
+            # 刷新是无效动作
             schedule_auto_refresh(account, "envelope HTTP %s" % status_int,
                                   revive=dead)
     else:
@@ -4654,6 +4679,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                         % (account.uid[:8], model, qw), level="WARN", tag="chat")
                     last_queued = exc
                     last_queued_wait = qw
+                    last_error = exc
+                    continue
+                if exc.code == 403 and _is_paid_wall(detail):
+                    # 112 付费墙：Free 计划被拒推理（计划层持久状态，与
+                    # credits 无关）——长冷却 1 小时、不刷 token；换号继续
+                    # （池里可能有已付费账号）
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    account.note_error(
+                        "paid wall (HTTP 403/112): Free plan, inference "
+                        "requires a paid subscription", cooldown=3600,
+                        single_account=(total <= 1))
+                    log("account %s hits paid wall (112) - Free plan rejected, "
+                        "cooling 1h, rotating" % account.uid[:8],
+                        level="WARN", tag="chat")
                     last_error = exc
                     continue
                 log("account %s rejected (HTTP %s), rotating"
@@ -7149,12 +7189,22 @@ class Handler(BaseHTTPRequestHandler):
                                         "elapsed_ms": wall_ms})
             except Exception as exc:
                 wall_ms = int((time.time() - t0) * 1000)
-                account.note_error(str(exc)[:80], cooldown=60)
+                # UpstreamStatus（信封 403 等）的 str 只有状态码——把 detail
+                # 过 friendly_upstream_error，付费墙/排队等才有可读结论
+                if isinstance(exc, UpstreamStatus):
+                    msg, _et = friendly_upstream_error(
+                        _to_int_status(exc.status), exc.detail)
+                    shown = msg
+                else:
+                    shown = str(exc)
+                account.note_error(shown[:120], cooldown=60)
                 log("account test: uid=%s model=%s wall=%dms exc=%s"
-                    % (account.uid[:8], test_model, wall_ms, exc),
+                    % (account.uid[:8], test_model, wall_ms, shown[:160]),
                     level="WARN", tag="accounts")
                 return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 500, "error": str(exc),
+                                        "status": _to_int_status(
+                                            getattr(exc, "status", 500)),
+                                        "error": shown[:400],
                                         "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
