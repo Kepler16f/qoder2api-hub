@@ -2031,9 +2031,11 @@ def _fake_release(tag):
 _hi_tag = "v%d.%d.%d" % (P.version_tuple(P.VERSION)[0] + 1,
                          P.version_tuple(P.VERSION)[1],
                          P.version_tuple(P.VERSION)[2])
-P.urllib.request.urlopen = lambda req, timeout=None: _UpdResp(_fake_release(_hi_tag))
+# fork：check_for_update 出站走 UPSTREAM_OPENER（GitHub 访问需代理感知），
+# patch urlopen 拦不到——经 UpstreamOpener._stub 注入。
+A.UpstreamOpener._stub = lambda req, timeout=None: _UpdResp(_fake_release(_hi_tag))
 _up_new = P.check_for_update(force=True)
-P.urllib.request.urlopen = lambda req, timeout=None: _UpdResp(_fake_release("v" + P.VERSION))
+A.UpstreamOpener._stub = lambda req, timeout=None: _UpdResp(_fake_release("v" + P.VERSION))
 _up_same = P.check_for_update(force=True)
 
 
@@ -2041,8 +2043,9 @@ def _boom(req, timeout=None):
     raise OSError("network down")
 
 
-P.urllib.request.urlopen = _boom
+A.UpstreamOpener._stub = _boom
 _up_err = P.check_for_update(force=True)
+A.UpstreamOpener._stub = None
 P.urllib.request.urlopen = _orig_urlopen_u
 check("check_for_update: 检测到更高版本 -> has_update",
       _up_new["ok"] and _up_new["has_update"] and _up_new["latest"] == _hi_tag, _up_new)

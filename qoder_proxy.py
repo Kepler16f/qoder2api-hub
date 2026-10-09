@@ -2764,7 +2764,7 @@ def check_for_update(force=False):
             "Accept": "application/vnd.github+json",
             "User-Agent": "qoder-proxy-update-check",
         })
-        with urllib.request.urlopen(req, timeout=8) as resp:
+        with UPSTREAM_OPENER.open(req, timeout=8) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         tag = str(data.get("tag_name") or "").strip()
         info.update({

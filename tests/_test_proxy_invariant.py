@@ -49,16 +49,19 @@ finally:
 check("fetch_credits 走统一出站函数 http_json（不直连）", n_fetch == 1, n_fetch)
 
 # 基线登记：直连 urlopen 的调用点数量。改动这个数字之前，先确认新点是否带账号凭证。
-src = open(os.path.join(ROOT, "qoder_accounts.py"), encoding="utf-8").read()
-n_direct = src.count("urllib.request.urlopen(")
-# task-80 收口后基线 3 -> 2：userinfo 调用（带 Authorization 凭证）已改走
-# http_json；剩余 2 处 = http_json 自身 + 设备轮询（不带凭证、依赖 404/202
-# 语义，判定为故意直连，见 qoder_accounts.py 中的注释）。
-check("qoder_accounts.py 直连 urlopen 基线 == 2（新增必须重新评估是否绕过收口）",
-      n_direct == 2, n_direct)
+# fork 校准：本仓库出站收口比上游更紧——所有带凭证调用（含上游收拢的
+# http_json 内部与更新检查）都走 UPSTREAM_OPENER（逐请求代理感知，修
+# WinError 10061 死端口 bug），故 qoder_accounts 直连为 0；qoder_proxy 仅剩
+# 本地端口探测 1 处（127.0.0.1，无代理语义）。新增直连前先评估：带凭证或
+# 公网访问的调用一律走 UPSTREAM_OPENER。
+src_a = open(os.path.join(ROOT, "qoder_accounts.py"), encoding="utf-8").read()
+n_direct_a = src_a.count("urllib.request.urlopen(")
 src_p = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 n_direct_p = src_p.count("urllib.request.urlopen(")
-check("qoder_proxy.py 直连 urlopen 基线 == 4（同上）", n_direct_p == 4, n_direct_p)
+check("qoder_accounts.py 直连 urlopen 基线 == 0（fork：凭证出站全走 UPSTREAM_OPENER）",
+      n_direct_a == 0, n_direct_a)
+check("qoder_proxy.py 直连 urlopen 基线 == 1（fork：仅本地端口探测）",
+      n_direct_p == 1, n_direct_p)
 
 print("")
 print("SUMMARY: TOTAL %d checks, %d passed, %d failed" % (PASS + FAIL, PASS, FAIL))

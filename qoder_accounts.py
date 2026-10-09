@@ -48,6 +48,10 @@ from qoder_fingerprint import (derive_id, generate_request_id,
 # 环境变量 QD_PROXY_UPSTREAM_PROXY 显式指定时优先生效（如 http://127.0.0.1:7890）。
 # ---------------------------------------------------------------------------
 class UpstreamOpener(object):
+    # 测试注入点：非 None 时 open() 直接委托（签名同 urllib.request.urlopen，
+    # 返回值需同时兼容 with 与裸调用）。生产恒为 None；测试用它拦截出站，
+    # 不必替换整个 urllib 模块对象（fork：上游测试桩 urlopen 拦不到本类）。
+    _stub = None
 
     @staticmethod
     def _handlers():
@@ -59,6 +63,8 @@ class UpstreamOpener(object):
         return [urllib.request.ProxyHandler(urllib.request.getproxies())]
 
     def open(self, req, timeout=None):
+        if UpstreamOpener._stub is not None:
+            return UpstreamOpener._stub(req, timeout=timeout)
         opener = urllib.request.build_opener(*self._handlers())
         if timeout is None:
             return opener.open(req)

@@ -141,12 +141,16 @@ def _run_open_upstream(pool, urlopen_impl, realm="cn"):
     P.SESSIONS = types.SimpleNamespace(get=lambda acct: _Sess())
     P.time = fake_time
     P.POOL = pool
+    # fork：open_upstream 出站走 UPSTREAM_OPENER（逐请求代理感知），
+    # 替换 P.urllib.request.urlopen 拦不到——经 UpstreamOpener._stub 注入。
+    A.UpstreamOpener._stub = urlopen_impl
     try:
         P.open_upstream(_PAYLOAD, session_key="fam-test", target_realm=realm)
         err = None
     except Exception as exc:
         err = exc
     finally:
+        A.UpstreamOpener._stub = None
         P.urllib = real_urllib
         P.SESSIONS = real_sessions
         P.time = real_time
