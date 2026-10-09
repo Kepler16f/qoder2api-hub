@@ -43,9 +43,10 @@ import webbrowser
 
 APP_NAME = "Qoder2API-Hub"
 APP_TITLE = "Qoder2API-Hub"
-# 桌面发行版版本：跟 GitHub release tag 走（发新版时同步 bump 这里）。
-# 检查更新用它对比最新 tag；网关本体的 VERSION 是另一条版本线（与上游对齐）。
-APP_VERSION = "1.3.3"
+# 桌面发行版版本：跟 GitHub release tag 走（发新版时同步 bump 这里），
+# 线格式 1.0.x_R（R=本仓库桌面发行线，与上游 tag 永不撞名）。检查更新按它
+# 对比本仓库 Releases；网关本体 VERSION 是另一条线（日期.序号_upstream/_re）。
+APP_VERSION = "1.0.2_R"
 DEFAULT_PORT = 8790
 LOG_NAME = "desktop-gateway.log"
 CONFIG_NAME = "desktop.json"
@@ -1109,11 +1110,24 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
                             if (os.environ.get("QD_DESKTOP_SETTINGS")
                                     or "").strip() in ("1", "true", "yes"):
                                 host.execute_script(
+                                    "window.__qdErrs=window.__qdErrs||[];"
+                                    "window.onerror=function(m,s,l,c,e){"
+                                    "__qdErrs.push(m+' @'+l+':'+c);return false;};"
                                     "switchMainTab('settings');"
                                     "JSON.stringify({bridge: !!window.__qdDesktop,"
+                                    "v: window.__qdDesktop ? window.__qdDesktop.v : 'NO-BRIDGE',"
                                     "sec: (document.getElementById('desktopSection')||{}).style"
                                     " ? document.getElementById('desktopSection').style.display : 'NO-EL',"
-                                    "tray: (document.getElementById('deskTray')||{}).checked})",
+                                    "tray: (document.getElementById('deskTray')||{}).checked,"
+                                    "errs: (window.__qdErrs||[]).slice(0,5),"
+                                    "dom: (function(){function vis(id){var e=document.getElementById(id);"
+                                    "return e? (e.style.display||getComputedStyle(e).display) : 'MISSING';}"
+                                    "return {desktopSec: vis('desktopSection'),"
+                                    "clientGroup: vis('clientSettingsGroup'),"
+                                    "limitsTbody: !!document.getElementById('limitsTbody'),"
+                                    "limitsRows: document.querySelectorAll('#limitsTbody tr').length,"
+                                    "lanToggle: !!document.getElementById('setLanToggle'),"
+                                    "deskTray: !!document.getElementById('deskTray')};})()})",
                                     lambda hr, res: print("[desktop] settings probe:", res))
                             if (os.environ.get("QD_DESKTOP_TOGGLE_TEST")
                                     or "").strip() in ("1", "true", "yes"):

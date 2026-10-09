@@ -69,7 +69,8 @@
 ## 从源码运行（不打包直接用）
 
 ```bash
-# Windows（需要本机 Python 3.9+，装了官方 Qoder 客户端还能白拿真身识别）
+# Windows（需要本机 Python 3.13+——3.11 的 ctypes 在 WebView2 COM 调用上
+# 会 access violation，勿用；装了官方 Qoder 客户端还能白拿真身识别）
 python desktop/qoder_desktop.py
 
 # macOS（内嵌 WKWebView 需要一次性安装）

@@ -158,6 +158,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           VER="${{ steps.ver.outputs.version }}"
+          # Debian 版本号不允许下划线：_R 后缀清洗为 +R（Inno/DMG 原样用 VER）
+          VER_DEB=$(echo "$VER" | tr '_' '+')
           case "${{ matrix.target }}" in
             linux-x64)   DEBARCH=amd64; PKGARCH=x64   ;;
             linux-arm64) DEBARCH=arm64; PKGARCH=arm64 ;;
@@ -181,7 +183,7 @@ jobs:
           EOF
           cat > "$ROOT/DEBIAN/control" <<EOF
           Package: qoder2api-hub
-          Version: $VER
+          Version: $VER_DEB
           Section: net
           Priority: optional
           Architecture: $DEBARCH

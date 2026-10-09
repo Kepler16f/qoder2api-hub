@@ -1,7 +1,7 @@
 # Qoder2API-Hub Desktop — Qoder 双区多账号网关 · 开箱即用桌面客户端
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.3.2-2496ED?style=flat-square" alt="Version 1.3.2">
+  <img src="https://img.shields.io/badge/Release-1.0.2_R-2496ED?style=flat-square" alt="Version 1.0.2_R">
   <img src="https://img.shields.io/badge/Desktop-Win_x64_·_Win_ARM64_·_macOS_·_Linux-8A2BE2?style=flat-square" alt="Desktop Platforms">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
@@ -31,6 +31,9 @@
 - **后台常驻定时调度器**：每日整点排程（09:00 / 21:00 签到 · 22:00 Token 集中保活），`drt-` / `jrt-` 按前缀路由刷新，PAT 最终兜底。
 - **双协议全功能支持**：同时支持标准 OpenAI Chat Completions 协议与 Responses API (Codex / Claude Code)，含 custom freeform 工具（`apply_patch`）双向转译、DSML 工具调用回退解析，以及**泄漏文本回读**（模型把历史工具调用序列化复述成正文时，流式/非流式/Responses 三链路都还原为结构化 `tool_calls`；若回声被**截断**无法还原，则按严格判据吞掉、绝不把内部标记透给用户，而普通回复一律 fail-open 不吞正文）。
 - **现代化 Web 看板**：弹性指标卡片、签到与福利中心、模型能力清单、性能指标与用量透视、实时请求流水与运行日志。
+- **配额护栏（上游 v1.3.0）**：每账号预算闸门——储备下限、日 token/credit 上限、单模型上限，耗尽的账号直接不参与挑选；计数由本地用量日志折叠（不新增上游调用），402 封存到 qoder 自家 UTC+8 10:00 重置，临期积分优先花掉；看板限额表 + 四态护栏徽章。
+- **失败治理三族（上游 v1.3.1）**：软频控指数退避、硬故障熔断、未知故障降权窗，六个接线点全断言兜底；用量行带 `reasoning_effort` 与按 Key 聚合视图。
+- **原生 Anthropic 入口（上游 v1.3.2）**`/v1/messages`：Claude Code / Anthropic 客户端直连，纯标准库转换模块；三入口（chat/responses/messages）共用同一处模型门控（全局禁用清单 + 按 Key 白名单）。
 
 > ⚡ 网关架构与交互对齐 WorkBuddy2API-Hub，上游协议替换为 Qoder COSY 签名体系；上游更新可在本仓库 rebase 携带。
 
@@ -481,10 +484,45 @@ python _verify_models.py --base http://127.0.0.1:8790
 （本仓库）；上游历史版本见
 [shuishuipingan/qoder2api-hub/releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
-> 版本线说明：桌面发行版用 `v1.3.x` tag（检查更新按它对比）；**网关本体自
-> 2026-10 起改用日期版本（`YYYY.MM.DD`）**，与上游 `1.2.x` 号线并行不再撞车
-> ——下文条目里的「网关 1.2.18/1.2.19/1.2.20」是改制前的 fork 旧号，仅为历史
-> 记录。
+> 版本线说明（两条线，互不干扰）：
+> - **桌面发行版**：`v1.0.x_R` tag（`R` = 本仓库桌面发行线；检查更新按它对比
+>   本仓库 Releases）。旧 tag `v1.3.0`/`v1.3.1`/`v1.3.2` 对应 `1.0.0_R`/内部
+>   构建/`1.0.1_R`，保留作历史。
+> - **网关本体**：`YYYY.MM.DD.N_后缀`（日期.当日序号_来源）——`_upstream` 为
+>   并入的上游提交、`_re` 为 fork 自有改动，与上游 `1.2.x`/`1.3.x` semver 号线
+>   天然不撞。历史号对应：`2026.10.07` ≈ 2026.10.7.1_upstream（上游 v1.2.18）、
+>   `2026.10.08` ≈ 2026.10.8.1_re（上下文压缩）；更早的「网关 1.2.18/1.2.19/
+>   1.2.20」是 fork 旧连号（1.2.18 与上游撞车才改制），仅为历史记录。
+
+### v1.0.2_R — 并入上游 v1.2.19–v1.3.4（网关 2026.10.9.1–8）+ 版本线改制
+
+**并入上游 7 个版本**（网关版本映射：日期.当日序号_upstream）：
+
+| 上游 | 网关版本 | 内容 |
+|---|---|---|
+| v1.2.19 | 2026.10.9.1_upstream | 积分复数 key 修复（用量行不再记 0） |
+| v1.3.0 | 2026.10.9.2_upstream | 配额护栏 + 用量区间 + 限额设置 |
+| v1.3.1 | 2026.10.9.3_upstream | tests/ 测试框架 + 失败三族 + 按 Key 用量 |
+| v1.3.2 | 2026.10.9.4_upstream | 原生 Anthropic `/v1/messages` + 三入口模型门控 |
+| v1.3.3 | 2026.10.9.5_upstream | 前端断言套件 + 按 Key effort 透视 |
+| v1.3.4 | 2026.10.9.6_upstream | Docker 缺模块修复 + 镜像冒烟 |
+| (docs) | 2026.10.9.7_upstream | README 指向 GHCR/Releases |
+
+**fork 手术（2026.10.9.8_re）**：合并后传输收口——上游收拢的 `http_json`
+内部走 `UPSTREAM_OPENER`（逐请求代理感知，死端口修复覆盖全部凭证出站），
+`check_for_update` 同步重接（URL 指向本仓库）；`UpstreamOpener._stub`
+测试注入点 + 直连基线校准（accounts=0 / proxy=1）；修复合并残留的
+`_usage_by_account_uncached` 空壳重复定义。
+
+**桌面功能**（随本版搭载）：token 自动刷新、LAN 可见开关（设置页）、
+设置区块分组；返回手势屏蔽、托盘「重启」、原生托盘菜单（深色感知）、
+检查更新指向本仓库。
+
+**版本线改制**：桌面发行线改 `v1.0.x_R`（本版 1.0.2_R）；网关改
+`日期.序号_upstream/_re` 后缀制。详见本节头部版本线说明。
+
+**验证**：上游测试框架 19/19 套件 880 检查全绿 + 遗留套件 630 检查
+0 失败；桌面壳冒烟（登录 → 设置页 → 截图）确认限额表与桌面区块共存渲染。
 
 ### v1.3.2 — 传输韧性、额度实时化与桌面体验修复
 
