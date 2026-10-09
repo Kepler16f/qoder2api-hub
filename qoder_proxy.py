@@ -2744,6 +2744,17 @@ def version_tuple(value):
     return tuple(out[:3])
 
 
+def _update_available(tag, current):
+    """版本线优先的更新判定（_R = 本仓库桌面发行线后缀）。"""
+    tag_is_r = "_R" in str(tag or "")
+    cur_is_r = "_R" in str(current or "")
+    if tag_is_r and not cur_is_r:
+        return True      # 新线已发布：旧线装机一律提示升级
+    if cur_is_r and not tag_is_r:
+        return False     # latest 还是旧线（过渡窗口）：不提示降级
+    return version_tuple(tag) > version_tuple(current)
+
+
 def check_for_update(force=False):
     """检查项目是否有新版本（对比当前 VERSION 与 GitHub 最新 release）。
 
@@ -2773,7 +2784,11 @@ def check_for_update(force=False):
             "url": str(data.get("html_url") or ""),
             "published_at": str(data.get("published_at") or ""),
             "name": str(data.get("name") or ""),
-            "has_update": bool(tag) and version_tuple(tag) > version_tuple(current),
+            # 版本线优先于数值：桌面发行线改 1.0.x_R 后，纯数值比较会把
+            # 1.0.2_R 误判为低于旧线 1.3.2（发布窗口期提示"降级"、旧线装机
+            # 永远不提示升级）。_R 线成为 latest 时旧线一律提示；latest 还是
+            # 旧线时不提示降级；同线内按数值。
+            "has_update": bool(tag) and _update_available(tag, current),
         })
     except Exception as exc:
         info["error"] = str(exc)[:160]

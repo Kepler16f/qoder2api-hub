@@ -2050,6 +2050,18 @@ P.urllib.request.urlopen = _orig_urlopen_u
 check("check_for_update: 检测到更高版本 -> has_update",
       _up_new["ok"] and _up_new["has_update"] and _up_new["latest"] == _hi_tag, _up_new)
 check("check_for_update: 同版本 -> 无更新", _up_same["ok"] and not _up_same["has_update"])
+
+# 版本线优先（桌面线改 1.0.x_R 后的跨线语义）
+A.UpstreamOpener._stub = lambda req, timeout=None: _UpdResp(_fake_release("v1.0.9_R"))
+_up_cross_new = P.check_for_update(force=True)
+A.UpstreamOpener._stub = lambda req, timeout=None: _UpdResp(_fake_release("v1.3.2"))
+_up_cross_old = P.check_for_update(force=True)
+A.UpstreamOpener._stub = None
+check("check_for_update: _R 新线 latest + 旧线 current -> 提示升级",
+      _up_cross_new["ok"] and _up_cross_new["has_update"]
+      and _up_cross_new["latest"] == "v1.0.9_R", _up_cross_new)
+check("check_for_update: 旧线 latest + _R current -> 不提示降级",
+      _up_cross_old["ok"] and not _up_cross_old["has_update"], _up_cross_old)
 check("check_for_update: 网络失败 -> ok=False + error（不误报有更新）",
       _up_err["ok"] is False and bool(_up_err["error"])
       and not _up_err["has_update"], _up_err)
