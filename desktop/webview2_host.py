@@ -312,7 +312,7 @@ class WebView2Host(object):
             com_call(self._webview, 6, HRESULT, [c_wchar_p], c_wchar_p(html))
 
     def harden_navigation(self):
-        """屏蔽返回手势与浏览器快捷键（无回调注册，纯 Settings 写）。
+        """屏蔽返回手势、双指缩放与浏览器快捷键（无回调注册，纯 Settings 写）。
 
         背景：壳先用 NavigateToString 显示网关开启动画，就绪后导航到看板；
         触控板横扫/鼠标侧键（或 Alt+←）会把 WebView 回退到启动动画——那里
@@ -322,14 +322,20 @@ class WebView2Host(object):
           - put_IsSwipeNavigationEnabled(FALSE)（槽 32）：关闭触控板横扫
             前进/后退与鼠标侧键导航；
           - put_AreBrowserAcceleratorKeysEnabled(FALSE)（槽 24）：关闭 F5/
-            Ctrl+P/Alt+←→ 等浏览器快捷键（看板有自身刷新，影响可接受）。
+            Ctrl+P/Alt+←→ 等浏览器快捷键（看板有自身刷新，影响可接受）；
+          - put_IsPinchZoomEnabled(FALSE)（槽 30）：关闭双指捏合缩放
+            （误触会整页缩放变形）。
+        写后**读回验证**（get 槽 23/29/31），设置没被上游接受时日志立现。
+        另配合壳侧 WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS 注入
+        --overscroll-history-navigation=0 --disable-pinch（Chromium 层
+        双保险，Settings 覆盖不到的滑动路径在这里封死）。
 
         ⚠️ 历史教训（勿走回头路）：曾尝试 add_NavigationStarting 拦截回退
         导航——WebView2 在**关闭/拆卸阶段**仍会投递事件，Python 回调在解释
         器 finalizing 时被调用 → Fatal PyEval_RestoreThread 随机崩溃（实测
         即使回调体为空也必崩）。事件注册类防护在此壳里一律禁用。
 
-        返回两个设置是否都成功。"""
+        返回全部设置是否都成功。"""
         if not self._webview:
             return False
         ok = []
@@ -343,11 +349,29 @@ class WebView2Host(object):
             if settings:
                 hr_sw = com_call(settings, 32, HRESULT, [c_int], 0)   # swipe
                 hr_key = com_call(settings, 24, HRESULT, [c_int], 0)  # accel keys
+                hr_pinch = com_call(settings, 30, HRESULT, [c_int], 0)  # pinch zoom
                 ok.append(hr_sw == S_OK)
                 ok.append(hr_key == S_OK)
-                if hr_sw != S_OK or hr_key != S_OK:
-                    print("[webview2] settings hr swipe=0x%08X accel=0x%08X"
-                          % (hr_sw & 0xFFFFFFFF, hr_key & 0xFFFFFFFF))
+                ok.append(hr_pinch == S_OK)
+                if hr_sw != S_OK or hr_key != S_OK or hr_pinch != S_OK:
+                    print("[webview2] settings hr swipe=0x%08X accel=0x%08X "
+                          "pinch=0x%08X"
+                          % (hr_sw & 0xFFFFFFFF, hr_key & 0xFFFFFFFF,
+                             hr_pinch & 0xFFFFFFFF))
+                # 读回验证（get 槽：accel 23 / pinch 29 / swipe 31）——
+                # 误触复发时日志能立刻看出设置是否真被上游接受
+                for name, get_slot in (("swipe", 31), ("accel", 23),
+                                       ("pinch", 29)):
+                    try:
+                        val = c_int(1)
+                        hr_g = com_call(settings, get_slot, HRESULT,
+                                        [POINTER(c_int)], byref(val))
+                        if hr_g == S_OK and val.value != 0:
+                            print("[webview2] WARN: %s still ENABLED after "
+                                  "put(FALSE)" % name)
+                            ok.append(False)
+                    except Exception:
+                        pass
         except Exception as exc:
             print("[webview2] harden_navigation failed: %r" % exc)
         finally:

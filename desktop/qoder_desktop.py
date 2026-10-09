@@ -2024,6 +2024,14 @@ def main(argv=None):
         os.environ["QD_DATA_DIR"] = opts["data_dir"]
     # 桌面发行版版本交给网关：「检查更新」按它对比本仓库的 release tag
     os.environ.setdefault("QD_APP_VERSION", APP_VERSION)
+    if sys.platform == "win32":
+        # WebView2 官方支持的环境变量：附加 Chromium 命令行开关。在
+        # **浏览器进程层**封死滑动返回与双指缩放（比 WebView2 Settings 更
+        # 底层——overscroll 历史导航是 Chromium 手势路由的一部分，个别
+        # 运行时版本对 IsSwipeNavigationEnabled 的覆盖不完整）。
+        os.environ.setdefault(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--overscroll-history-navigation=0 --disable-pinch")
     if opts["mode"] == "smoke":
         return smoke_test(pick_free_port(opts["port"]))
     if opts["mode"] == "smoke-gui":
