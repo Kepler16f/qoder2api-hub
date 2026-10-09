@@ -4318,10 +4318,11 @@ def friendly_upstream_error(code, detail):
                 "upstream_queued")
     # 3) 上游付费墙（112：Free 计划被拒推理；与 credits 余额无关）
     if code_i == 403 and _is_paid_wall(detail):
-        return ("上游付费墙 (HTTP 403/112)：该账号为 Free 计划，上游已停止"
-                "对其提供推理服务（与剩余额度无关）。需到 "
-                "qoder.com/pricing 订阅付费计划，或改用其他已付费账号/"
-                "国内版账号。上游详情：%s" % detail[:200],
+        return ("上游拒绝为 Free 计划提供推理 (HTTP 403/112)：与剩余额度无关。"
+                "多为上游高峰期限流或免费层政策调整（实测同日 15-19 点正常、"
+                "19 点后切换），网关每小时自动重试；持续多日不恢复则需订阅"
+                " qoder.com/pricing 或改用国内版账号。上游详情：%s"
+                % detail[:200],
                 "upstream_paid_wall")
     if _is_transient_upstream(code_i, detail) or (
             "provider_error" in detail and "invalid_" not in detail):
