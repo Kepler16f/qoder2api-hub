@@ -58,7 +58,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.9.11_re"
+VERSION = "2026.10.10.1_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3712,26 +3712,40 @@ def _prompt_token_budget():
         return PROMPT_TOKEN_BUDGET_DEFAULT
 
 
-def _estimate_tokens(messages):
-    """粗估会话 token：字符/3 + 每消息固定开销 + tool_calls 序列化。
+_CJK_RE = re.compile(r"[\u3000-\u303f\u3400-\u4dbf\u4e00-\u9fff"
+                     r"\uf900-\ufaff\uff00-\uffef]")
 
-    误差 ±30%（中英代码混合），做软预算足够——预算本身就留了大缓冲。
+
+def _estimate_tokens(messages):
+    """估算会话 token：CJK 按 ~1 token/字、其余按 ~0.3 token/字。
+
+    此前用 chars/3 一刀切，对中文密集内容低估近 2.7 倍（实测：估算 70 万
+    的会话上游数出 189 万），导致压缩不到位、被上游 400 超限拒收。
+    CJK 字符按 1.05 + 其余 0.3，对中英混合内容误差 ~±15%。
     """
     total = 0
     for m in messages or []:
         if not isinstance(m, dict):
             continue
         total += 8
+        chunks = []
         c = m.get("content")
         if isinstance(c, str):
-            total += len(c) // 3
+            chunks.append(c)
         elif isinstance(c, list):
             for part in c:
                 if isinstance(part, dict):
-                    total += len(str(part.get("text") or "")) // 3
+                    chunks.append(str(part.get("text") or ""))
         calls = m.get("tool_calls")
         if calls:
-            total += len(json.dumps(calls, ensure_ascii=False)) // 3
+            chunks.append(json.dumps(calls, ensure_ascii=False))
+        for text in chunks:
+            n = len(text)
+            if n > 200:
+                cjk = len(_CJK_RE.findall(text))
+                total += int(cjk * 1.05 + (n - cjk) * 0.3)
+            else:
+                total += max(1, n // 2)    # 短文本给保守估值
     return total
 
 
@@ -3769,7 +3783,7 @@ def _summarize_content(text, limit=_HISTORY_SUMMARY_CHARS):
     return flat[:limit] + " …[[qoder-proxy: 已压缩为摘要]]"
 
 
-def compress_prompt_budget(messages, model=""):
+def compress_prompt_budget(messages, model="", budget_override=None):
     """估算超预算时对**历史轮**做渐进压缩（system 与最后一轮永不碰）。
 
     档位从轻到重，每档作用于全部历史轮、每档后重新估算，达标即停：
@@ -3781,7 +3795,8 @@ def compress_prompt_budget(messages, model=""):
     返回 (新列表, 动作描述)。幂等：客户端每轮发全量历史，本函数每请求
     重新评估；压缩作用于副本，不动调用方的 payload。
     """
-    budget = _prompt_token_budget()
+    budget = _prompt_token_budget() if budget_override is None \
+        else int(budget_override)
     if budget <= 0 or not messages:
         return messages, ""
     est = _estimate_tokens(messages)
@@ -3955,12 +3970,16 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
     return system_text, flat, images
 
 
-def build_qoder_body(payload, account, model_key, realm=None):
+def build_qoder_body(payload, account, model_key, realm=None,
+                     budget_scale=1.0):
     """构造 agent_chat_generation 上游请求体（返回 dict，随后 qoder_encode）。
 
     以官方 baseprompt.json 为骨架：每次覆写 request/session id、时间戳、
     模型配置（按出口区域的官方清单取元数据）、系统提示词与会话、工具、
     参数与 business 会话名。
+
+    budget_scale < 1：上游报"超上下文上限"后的加压重试——把压缩预算按比例
+    调小（如 0.5 = 预算减半），重建更小的 body 再试一次。
     """
     r = realm or (account.realm if account else CURRENT_REALM)
     body = json.loads(json.dumps(BASEPROMPT))   # deep copy
@@ -3970,7 +3989,11 @@ def build_qoder_body(payload, account, model_key, realm=None):
     messages = backfill_reasoning_content(messages, model, model_key)
     # 输入预算：估算超限时对历史轮做渐进压缩（system/当前轮不动），
     # 防止会话历史撞上游总 token 硬顶后输出被掐（见 compress_prompt_budget）
-    messages, _budget_note = compress_prompt_budget(messages, model)
+    _budget = _prompt_token_budget()
+    messages, _budget_note = compress_prompt_budget(
+        messages, model,
+        budget_override=int(_budget * budget_scale) if budget_scale != 1.0
+        else None)
 
     # 形态决策**单点**（设计文档 §0 原则①）：Anthropic 等新入口会把决定好的
     # 结果放在 payload["_qd_structured"] 里下传，这里优先采信它；只有 chat 主链路
@@ -4259,6 +4282,18 @@ def _is_paid_wall(detail):
     return '"code":"112"' in d or '"code": "112"' in d or "pricingUrl" in d
 
 
+# 上游"超上下文上限"错误标记（DeepSeek 等模型 400 provider_error 内嵌）
+_CONTEXT_OVERFLOW_MARKERS = (
+    "maximum context length", "reduce the length of the message",
+    "context length is", "prompt is too long", "input tokens exceed",
+)
+
+
+def _is_context_overflow(detail):
+    d = str(detail or "")
+    return any(m in d for m in _CONTEXT_OVERFLOW_MARKERS)
+
+
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
 
@@ -4321,6 +4356,12 @@ def friendly_upstream_error(code, detail):
                 "约 %d 秒后可用，请稍后重试（换模型或换区域可立即绕开）。"
                 "上游详情：%s" % (qw, detail[:200]),
                 "upstream_queued")
+    # 2.5) 上游超上下文上限（估算漏压的兜底已自动加压重试过仍超）
+    if _is_context_overflow(detail):
+        return ("会话超过该模型的上下文上限 (HTTP %s)：网关已自动压缩并"
+                "加压重试仍超限。请压缩/清理会话历史，或换更大窗口的模型。"
+                "上游详情：%s" % (code_i, detail[:250]),
+                "context_overflow")
     # 3) 上游付费墙（112：该**模型**对 Free 计划收费；与 credits 余额无关）
     if code_i == 403 and _is_paid_wall(detail):
         return ("该模型对 Free 计划收费 (HTTP 403/112)：与账号剩余额度无关"
@@ -4553,6 +4594,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     last_queued_wait = 0
     waited_cool = False
     queue_wait_spent = 0        # 10605 原地等待累计（秒），上限 QUEUE_WAIT_TOTAL_MAX
+    overflow_retried = False    # 上游超限后的加压重建重试（只做一次）
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
@@ -4743,6 +4785,25 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                         % account.uid[:8], level="ERROR")
                 schedule_auto_refresh(account, "HTTP %d" % exc.code,
                                       revive=dead)
+                last_error = exc
+                continue
+            if _is_context_overflow(detail):
+                # 上游报"超上下文上限"（估算漏压的兜底）：把压缩预算砍半重建
+                # body 重试一次；仍超限才按 4xx 快速失败。确定性错误——同
+                # body 重试必再失败，必须重建。
+                if not overflow_retried:
+                    overflow_retried = True
+                    body_obj = build_qoder_body(
+                        payload, account, model_key, realm=realm,
+                        budget_scale=0.5)
+                    log("context overflow on '%s' (est missed) - rebuilt "
+                        "body at half budget, retrying" % model,
+                        level="WARN", tag="chat")
+                    last_error = exc
+                    continue
+                account.note_error(
+                    "context overflow: HTTP %s %s" % (exc.code, detail[:80]),
+                    cooldown=60, single_account=(total <= 1))
                 last_error = exc
                 continue
             if _is_transient_upstream(exc.code, detail):
