@@ -58,7 +58,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.9.10_re"
+VERSION = "2026.10.9.11_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4223,6 +4223,11 @@ _CONTENT_POLICY_MARKERS = (
 )
 
 
+# 10605 排队的原地等待总预算（秒）：上游给了 retryAfterSeconds，预算内等待后
+# 同账号重试（客户端无感）；QD_QUEUE_WAIT_MAX 可调，0=关闭（直接冷却换号）。
+QUEUE_WAIT_TOTAL_MAX = 120
+
+
 def _queue_wait_seconds(detail):
     """上游 10605 排队信封（HTTP 403 + isQueued/serviceAvailable:false）的
     等待秒数；非排队信封返回 None。
@@ -4443,11 +4448,22 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
                 if not should_retry_envelope(exc, False, attempt):
                     raise
-                log("in-stream envelope status %s on model '%s' "
-                    "(try %d/%d), reopening upstream"
-                    % (exc.status, model, attempt + 1,
-                       TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
-                time.sleep(attempt + 1)
+                # 10605 排队：等上游给的 retryAfterSeconds 再重开（立即重开
+                # 必再撞）；其余错误维持原有的短退避
+                qw = _queue_wait_seconds(exc.detail)
+                if qw:
+                    wait = min(qw, 30)
+                    log("in-stream queue (10605) on '%s' - waiting %ds before "
+                        "reopening (try %d/%d)"
+                        % (model, wait, attempt + 1,
+                           TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
+                    time.sleep(wait)
+                else:
+                    log("in-stream envelope status %s on model '%s' "
+                        "(try %d/%d), reopening upstream"
+                        % (exc.status, model, attempt + 1,
+                           TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
+                    time.sleep(attempt + 1)
                 try:
                     new_resp, account, _ = open_upstream(
                         payload, session_key=session_key, target_realm=realm)
@@ -4536,6 +4552,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     last_queued = None          # 403+10605 排队信封（模型容量）：带 wait 上抛
     last_queued_wait = 0
     waited_cool = False
+    queue_wait_spent = 0        # 10605 原地等待累计（秒），上限 QUEUE_WAIT_TOTAL_MAX
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
@@ -4667,16 +4684,29 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
             if exc.code in (401, 403):
                 qw = _queue_wait_seconds(detail) if exc.code == 403 else None
                 if qw:
-                    # 10605 排队信封：上游模型容量不足（所有账号会同错），
-                    # 是模型级瞬时限流而非凭证问题——模型冷却 qw 秒、
-                    # 不刷 token（刷新是无效动作），换号继续探明是否全池排队
+                    # 10605 排队信封：上游明确给了 retryAfterSeconds——预算内
+                    # **原地等待后同账号重试**（客户端无感），预算用尽才冷却
+                    # 换号/上抛。总预算 QUEUE_WAIT_TOTAL_MAX（默认 120s）。
+                    remain = QUEUE_WAIT_TOTAL_MAX - queue_wait_spent
+                    if remain >= 5:
+                        wait = min(qw, remain)
+                        queue_wait_spent += wait
+                        log("model queued (10605) on '%s' - waiting %ds then "
+                            "retrying same account (spent %d/%ds)"
+                            % (model, wait, queue_wait_spent,
+                               QUEUE_WAIT_TOTAL_MAX), level="WARN", tag="chat")
+                        time.sleep(wait)
+                        tried.discard(account.uid)   # 等完允许重选同账号
+                        last_error = exc
+                        continue
+                    # 预算用尽：模型冷却 + 换号探池（其他账号可能不同状态）
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
                     account.note_error("model queued (HTTP 403/10605)",
                                        model=model, cooldown=qw,
                                        single_account=(total <= 1))
-                    log("account %s model queued (10605) on '%s' - model "
-                        "cooldown %ds, rotating"
+                    log("account %s model queued (10605) on '%s' - wait budget "
+                        "exhausted, model cooldown %ds, rotating"
                         % (account.uid[:8], model, qw), level="WARN", tag="chat")
                     last_queued = exc
                     last_queued_wait = qw
@@ -7168,6 +7198,25 @@ class Handler(BaseHTTPRequestHandler):
             t0 = time.time()
             ok, reply_text, exc, wall_ms = _try_model(test_model)
             paywalled_note = ""
+
+            def _queue_wait_of(exc):
+                """排队等待秒数：RateLimited 收尾或流内信封两种形态。"""
+                if isinstance(exc, RateLimited) and "queued" in (exc.detail or ""):
+                    return 30
+                if isinstance(exc, UpstreamStatus):
+                    return _queue_wait_seconds(exc.detail)
+                return None
+
+            # 10605 排队：等上游建议的时间后重测一次（把"暂时排队"测成
+            # 真结论，而不是立即报"排队中"）
+            if not ok:
+                qw = _queue_wait_of(exc)
+                if qw:
+                    wait = min(qw, 45)
+                    log("account test queued on '%s' - waiting %ds then "
+                        "retesting" % (test_model, wait), tag="accounts")
+                    time.sleep(wait)
+                    ok, reply_text, exc, wall_ms = _try_model(test_model)
             if not ok and test_model == "auto" \
                     and _is_paid_wall(getattr(exc, "detail", "") or ""):
                 # 112 是模型级付费墙（auto/GLM/DeepSeek 对 Free 收费，
@@ -7192,24 +7241,38 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         exc = exc2
                         wall_ms = int((time.time() - t0) * 1000)
+
+            def _save_test(ok_flag, text):
+                account.last_test = {
+                    "at": time.strftime("%m-%d %H:%M:%S"),
+                    "ok": bool(ok_flag),
+                    "text": str(text)[:160],
+                }
+                if getattr(account, "path", ""):
+                    try:
+                        account.save(os.path.dirname(account.path))
+                    except Exception:
+                        pass
+
             if ok:
                 account.clear_error()
+                note = paywalled_note or None
+                _save_test(True, ("测试通过 [%s] %s" % (test_model, reply_text))
+                           if not paywalled_note else
+                           ("auto 收费，%s 验证通过" % test_model))
                 log("account test: uid=%s model=%s wall=%dms ok=True%s"
                     % (account.uid[:8], test_model, wall_ms, paywalled_note),
                     tag="accounts")
                 return self._json(200, {"ok": True, "uid": account.uid,
                                         "model": test_model,
-                                        "note": paywalled_note or None,
+                                        "note": note,
                                         "elapsed_ms": wall_ms,
                                         "reply": reply_text})
-            if (isinstance(exc, RateLimited)
-                    and "queued" in (exc.detail or "")) or (
-                    isinstance(exc, UpstreamStatus)
-                    and _queue_wait_seconds(exc.detail)):
-                # 10605 排队（收尾 RateLimited 或流内信封两种形态）：请求已被
-                # 上游接受进队列——凭证与权益均有效，只是模型容量暂时不足；
-                # 账号测试视为通过
+            if _queue_wait_of(exc):
+                # 10605 排队（等待重测后仍在队列）：请求已被上游接受——
+                # 凭证与权益均有效，只是模型容量暂时不足；视为通过
                 account.clear_error()
+                _save_test(True, "模型排队中 (10605)，账号有效")
                 log("account test: uid=%s model=%s ok=True (queued)"
                     % (account.uid[:8], test_model), tag="accounts")
                 return self._json(200, {"ok": True, "uid": account.uid,
@@ -7241,6 +7304,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             account.note_error(shown[:120], cooldown=60)
+            _save_test(False, shown[:160])
             log("account test: uid=%s model=%s wall=%dms exc=%s"
                 % (account.uid[:8], test_model, wall_ms, shown[:160]),
                 level="WARN", tag="accounts")

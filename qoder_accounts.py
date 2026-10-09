@@ -1198,6 +1198,9 @@ class Account(object):
         # 按模型粒度的限流冷却：上游频控只针对单模型，不能拖垮整个账号。
         self.model_cooldowns = {}
         self.credits = data.get("credits") or None
+        # 最近一次「账号测试」的结论（{at, text}，落盘）：看板卡片持久显示，
+        # 避免测试结果只靠一闪而过的 toast。
+        self.last_test = data.get("lastTest") or None
         # 运行时标记（不落盘）：本账号刚消耗过额度，网关应按需尽快回读 quota。
         self.credits_dirty = False
         # ---- task-61：账号级预算护栏状态（默认全关；计数 None = 未知 -> fail-open）----
@@ -1261,6 +1264,7 @@ class Account(object):
             "source": self.source,
             "enabled": self.enabled,
             "lastError": self.last_error,
+            "lastTest": self.last_test,
             "cooldownUntil": self.cooldown_until,
             "credits": self.credits,
             "plan": self.plan,
@@ -1288,6 +1292,7 @@ class Account(object):
             "hasRefreshToken": bool(self.refresh_token),
             "hasPAT": bool(self.personal_token),
             "lastError": self.last_error,
+            "lastTest": self.last_test,
             "inCooldown": self.cooldown_until > time.time(),
             "cooldownFor": round(max(0.0, self.cooldown_until - time.time())) or None,
             "addedAt": self.added_at,
