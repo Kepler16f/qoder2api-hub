@@ -58,7 +58,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.9.9_re"
+VERSION = "2026.10.9.10_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -7202,10 +7202,13 @@ class Handler(BaseHTTPRequestHandler):
                                         "note": paywalled_note or None,
                                         "elapsed_ms": wall_ms,
                                         "reply": reply_text})
-            if isinstance(exc, RateLimited) \
-                    and "queued" in (exc.detail or ""):
-                # 10605 排队：请求已被上游接受进队列——凭证与权益均有效，
-                # 只是模型容量暂时不足；账号测试视为通过
+            if (isinstance(exc, RateLimited)
+                    and "queued" in (exc.detail or "")) or (
+                    isinstance(exc, UpstreamStatus)
+                    and _queue_wait_seconds(exc.detail)):
+                # 10605 排队（收尾 RateLimited 或流内信封两种形态）：请求已被
+                # 上游接受进队列——凭证与权益均有效，只是模型容量暂时不足；
+                # 账号测试视为通过
                 account.clear_error()
                 log("account test: uid=%s model=%s ok=True (queued)"
                     % (account.uid[:8], test_model), tag="accounts")
