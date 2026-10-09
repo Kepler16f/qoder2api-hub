@@ -4223,6 +4223,26 @@ _CONTENT_POLICY_MARKERS = (
 )
 
 
+def _queue_wait_seconds(detail):
+    """上游 10605 排队信封（HTTP 403 + isQueued/serviceAvailable:false）的
+    等待秒数；非排队信封返回 None。
+
+    国际版模型容量不足时上游用 403+10605 表达"请求已排队、N 秒后重试"——
+    这是模型级瞬时限流，不是凭证/权限问题（所有账号同错即坐实）。
+    嵌套转义不影响子串与数字匹配。
+    """
+    d = str(detail or "")
+    if "10605" not in d and "isQueued" not in d:
+        return None
+    m = re.search(r"retryAfterSeconds\D+(\d+)", d)
+    if not m:
+        return 30
+    try:
+        return max(1, int(m.group(1)))
+    except Exception:
+        return 30
+
+
 def _is_transient_upstream(code, detail):
     """判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
 
@@ -4278,6 +4298,13 @@ def friendly_upstream_error(code, detail):
                 "工具定义或粘贴的代码/文本）后重试。上游详情：%s"
                 % detail[:300],
                 "content_policy_rejected")
+    # 2) 上游模型排队（10605：模型容量不足，所有账号会同错；非凭证问题）
+    qw = _queue_wait_seconds(detail) if code_i == 403 else None
+    if qw:
+        return ("上游模型排队中 (HTTP 403/10605)：该模型当前容量不足，"
+                "约 %d 秒后可用，请稍后重试（换模型或换区域可立即绕开）。"
+                "上游详情：%s" % (qw, detail[:200]),
+                "upstream_queued")
     if _is_transient_upstream(code_i, detail) or (
             "provider_error" in detail and "invalid_" not in detail):
         return ("上游瞬时故障 (HTTP %s)：网关已对同账号自动重试仍失败，"
@@ -4335,8 +4362,10 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             account.save(ACCOUNTS_DIR) if account.path else None
             log("account %s session dead via envelope (TOKEN_EXPIRE) - disabled"
                 % account.uid[:8], level="ERROR")
-        schedule_auto_refresh(account, "envelope HTTP %s" % status_int,
-                              revive=dead)
+        if not is_queue:
+            # 10605 排队是模型容量问题，token 没毛病——刷新是无效动作
+            schedule_auto_refresh(account, "envelope HTTP %s" % status_int,
+                                  revive=dead)
     else:
         account.note_error("envelope HTTP %s: %s" % (status_int, detail[:80]),
                            cooldown=15, single_account=(total <= 1))
@@ -4478,6 +4507,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     last_error = None
     last_429 = None
     last_429_detail = ""
+    last_queued = None          # 403+10605 排队信封（模型容量）：带 wait 上抛
+    last_queued_wait = 0
     waited_cool = False
 
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
@@ -4608,6 +4639,23 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                 last_429_detail = detail
                 continue
             if exc.code in (401, 403):
+                qw = _queue_wait_seconds(detail) if exc.code == 403 else None
+                if qw:
+                    # 10605 排队信封：上游模型容量不足（所有账号会同错），
+                    # 是模型级瞬时限流而非凭证问题——模型冷却 qw 秒、
+                    # 不刷 token（刷新是无效动作），换号继续探明是否全池排队
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    account.note_error("model queued (HTTP 403/10605)",
+                                       model=model, cooldown=qw,
+                                       single_account=(total <= 1))
+                    log("account %s model queued (10605) on '%s' - model "
+                        "cooldown %ds, rotating"
+                        % (account.uid[:8], model, qw), level="WARN", tag="chat")
+                    last_queued = exc
+                    last_queued_wait = qw
+                    last_error = exc
+                    continue
                 log("account %s rejected (HTTP %s), rotating"
                     % (account.uid[:8], exc.code))
                 if session_key and POOL:
@@ -4703,6 +4751,14 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
         if last_429 is not None:
             raise RateLimited(last_429, last_429_detail,
                               wait=retry_after_seconds(model, realm))
+        if last_queued is not None:
+            # 全池 10605 排队：按上游给的 retryAfterSeconds 以 429 语义上抛
+            # （客户端收到"稍等 N 秒"而不是误导性的 403 凭证错误）
+            raise RateLimited(
+                last_queued,
+                "upstream model queued (10605): retry in ~%ds"
+                % last_queued_wait,
+                wait=last_queued_wait)
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
