@@ -997,7 +997,9 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
     root.bind("<Button-3>", popup_menu)
 
     # -- 嵌入区 --------------------------------------------------------------
-    web = tk.Frame(root, background="#f6f7f9")
+    # WebView 宿主背景跟随深色：启动动画期间/WebView 边缘露出的就是这块
+    root.config(bg="#0b1220" if dark else None)
+    web = tk.Frame(root, background="#0b1220" if dark else "#f6f7f9")
     web.pack(side="top", fill="both", expand=True)
     root.update_idletasks()
 
