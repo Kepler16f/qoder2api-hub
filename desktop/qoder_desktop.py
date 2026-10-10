@@ -137,7 +137,11 @@ HIDE_SCROLLBAR_JS = (
     "html{scrollbar-width:none}"
     "html,body{overscroll-behavior:none}';"
     "(document.documentElement||document.head||document.body||document)"
-    ".appendChild(s);}"
+    ".appendChild(s);"
+    # 双指缩放兜底：Settings 的 IsZoomControlEnabled 管 Ctrl+滚轮，但个别
+    # 触控板驱动把捏合直接发成 wheel+ctrlKey 之外的事件——JS 层再拦一层
+    # （被动监听无法 cancel，用 capture+passive:false 抢在合成器前）
+    "try{document.addEventListener('wheel',function(e){if(e.ctrlKey||e.altKey){e.preventDefault();e.stopPropagation()}},{passive:false,capture:true});}catch(e){}"
     "add();document.addEventListener('DOMContentLoaded',add);})()")
 
 # 强制深色调色板（与 dashboard.html 的 @media dark 块同源；仅 QD_FORCE_DARK

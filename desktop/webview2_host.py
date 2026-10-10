@@ -350,18 +350,23 @@ class WebView2Host(object):
                 hr_sw = com_call(settings, 32, HRESULT, [c_int], 0)   # swipe
                 hr_key = com_call(settings, 24, HRESULT, [c_int], 0)  # accel keys
                 hr_pinch = com_call(settings, 30, HRESULT, [c_int], 0)  # pinch zoom
+                # 触控板捏合在 Chromium 里转成 Ctrl+滚轮缩放——IsPinchZoomEnabled
+                # 只管合成器 pinch，控制后者的是 IsZoomControlEnabled（槽 18）
+                hr_zoom = com_call(settings, 18, HRESULT, [c_int], 0)
                 ok.append(hr_sw == S_OK)
                 ok.append(hr_key == S_OK)
                 ok.append(hr_pinch == S_OK)
-                if hr_sw != S_OK or hr_key != S_OK or hr_pinch != S_OK:
+                ok.append(hr_zoom == S_OK)
+                if hr_sw != S_OK or hr_key != S_OK or hr_pinch != S_OK \
+                        or hr_zoom != S_OK:
                     print("[webview2] settings hr swipe=0x%08X accel=0x%08X "
-                          "pinch=0x%08X"
+                          "pinch=0x%08X zoom=0x%08X"
                           % (hr_sw & 0xFFFFFFFF, hr_key & 0xFFFFFFFF,
-                             hr_pinch & 0xFFFFFFFF))
-                # 读回验证（get 槽：accel 23 / pinch 29 / swipe 31）——
+                             hr_pinch & 0xFFFFFFFF, hr_zoom & 0xFFFFFFFF))
+                # 读回验证（get 槽：accel 23 / pinch 29 / swipe 31 / zoom 17）——
                 # 误触复发时日志能立刻看出设置是否真被上游接受
                 for name, get_slot in (("swipe", 31), ("accel", 23),
-                                       ("pinch", 29)):
+                                       ("pinch", 29), ("zoom", 17)):
                     try:
                         val = c_int(1)
                         hr_g = com_call(settings, get_slot, HRESULT,

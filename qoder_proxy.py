@@ -58,7 +58,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.10.6_re"
+VERSION = "2026.10.10.7_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4674,6 +4674,16 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
             except Exception as exc:
                 last_exc = exc
                 detail = ""
+                # DNS 解析失败（getaddrinfo，实测窗口可达数分钟：18:00 与
+                # 13:08 两批各持续 ~3 分钟）：1s/2s 密集重试只是空转、还拖慢
+                # 故障可见性——首错等 30s 让解析窗口过去再走常规重试/sweep。
+                if isinstance(exc, socket.gaierror) and tries == 0:
+                    log("DNS resolve failed on '%s' (try %d/%d): waiting "\
+                        "30s for resolution to recover"\
+                        % (model, tries + 1, TRANSIENT_MAX_RETRIES + 1),
+                        level="WARN", tag="chat")
+                    time.sleep(30)
+                    continue
                 # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试；
                 # 若还有官方备用推理域名，优先换域名（对整域故障更有效）。
                 if _is_transient_transport(exc) \
