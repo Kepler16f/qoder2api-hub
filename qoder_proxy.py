@@ -43,6 +43,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import subprocess
 
 import qoder_accounts
 import qoder_anthropic
@@ -52,13 +53,25 @@ import qoder_sign
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
+
+
+def _flush_dns_cache():
+    """清 Windows DNS Client 缓存（负缓存会遮蔽 TUN/代理恢复后的解析）。
+
+    幂等、静默失败（非 Windows/权限不足不影响主流程）。
+    """
+    try:
+        subprocess.run(["ipconfig", "/flushdns"],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
 from pathlib import Path
 
 # 网关版本 = 日期.当日序号_来源后缀（_upstream=并入的上游提交，_re=fork 自有改动）。
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.10.7_re"
+VERSION = "2026.10.10.8_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4676,13 +4689,34 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                 detail = ""
                 # DNS 解析失败（getaddrinfo，实测窗口可达数分钟：18:00 与
                 # 13:08 两批各持续 ~3 分钟）：1s/2s 密集重试只是空转、还拖慢
-                # 故障可见性——首错等 30s 让解析窗口过去再走常规重试/sweep。
-                if isinstance(exc, socket.gaierror) and tries == 0:
-                    log("DNS resolve failed on '%s' (try %d/%d): waiting "\
-                        "30s for resolution to recover"\
-                        % (model, tries + 1, TRANSIENT_MAX_RETRIES + 1),
-                        level="WARN", tag="chat")
-                    time.sleep(30)
+                # 故障可见性。**关键**：Windows DNS Client 会缓存解析失败
+                # （负缓存 ~30s）——TUN/代理恢复后缓存里还是失败结果，表现
+                # 为"必须重启网关"。修复：flush DNS 缓存 + 短间隔探测恢复，
+                # 恢复后立即走正常请求。
+                if isinstance(exc, socket.gaierror):
+                    if tries == 0:
+                        log("DNS resolve failed on '%s': flushing DNS cache "
+                            "and probing recovery" % model,
+                            level="WARN", tag="chat")
+                    _flush_dns_cache()
+                    # 每 10 秒探测一次 DNS 是否恢复（最多 60 秒 = 6 次）
+                    recovered = False
+                    for probe in range(6):
+                        time.sleep(10)
+                        try:
+                            host = urllib.parse.urlparse(raw_url).hostname
+                            socket.getaddrinfo(host, 443,
+                                               proto=socket.IPPROTO_TCP)
+                            recovered = True
+                            break
+                        except socket.gaierror:
+                            continue
+                    if recovered:
+                        log("DNS recovered after %ds on '%s' - retrying"
+                            % ((probe + 1) * 10, model), tag="chat")
+                        continue
+                    # 未恢复：走常规失败路径（sweep/换号）
+                    last_error = exc
                     continue
                 # 传输层瞬时故障（TLS EOF / 连接重置 / 超时）同样原地重试；
                 # 若还有官方备用推理域名，优先换域名（对整域故障更有效）。
