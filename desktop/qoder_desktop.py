@@ -853,13 +853,36 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
     dark = force_dark or is_system_dark()
     force_light = (os.environ.get("QD_FORCE_LIGHT") or "").strip() \
         in ("1", "true", "yes")   # 验证用：强制 WebView2 浅色（Profile API）
-    if sys.platform == "win32":
+
+    def _apply_titlebar():
+        """DWM 深色标题栏：窗口完全实现后调用才可靠（winfo_id 需窗口映射）。
+        返回是否成功，失败时日志可见。"""
+        if sys.platform != "win32":
+            return False
         try:
             import ctypes as _ct
-            _apply_windows_titlebar_theme(
-                _ct.windll.user32.GetAncestor(root.winfo_id(), 2), dark)
-        except Exception:
-            pass
+            root.update_idletasks()   # 确保 HWND 有效
+            hwnd = _ct.windll.user32.GetAncestor(root.winfo_id(), 2)
+            if not hwnd:
+                print("[desktop] titlebar: GetAncestor returned NULL")
+                return False
+            ok = _apply_windows_titlebar_theme(hwnd, dark)
+            if not ok:
+                print("[desktop] titlebar: DwmSetWindowAttribute failed "
+                      "(hwnd=%s dark=%s)" % (hwnd, dark))
+            return ok
+        except Exception as exc:
+            print("[desktop] titlebar theme error: %r" % exc)
+            return False
+
+    _apply_titlebar()
+    # 窗口完全显示后重申一次（某些系统上首次调用在窗口映射前被忽略）
+    root.after(200, _apply_titlebar)
+    # 每 30 秒重申（防止系统主题切换/窗口重建后丢失）
+    def _reapply_titlebar():
+        _apply_titlebar()
+        root.after(30000, _reapply_titlebar)
+    root.after(30000, _reapply_titlebar)
     try:
         for icon in (os.path.join(bundle_dir(), "qoder2api.png"),
                      os.path.join(repo_dir(), "desktop", "assets",
