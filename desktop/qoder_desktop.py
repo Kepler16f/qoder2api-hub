@@ -127,13 +127,15 @@ def error_html(message, with_retry_js=False):
 HIDE_SCROLLBAR_JS = (
     "(function(){function add(){if(document.getElementById('__qd_nosb'))return;"
     "var s=document.createElement('style');s.id='__qd_nosb';"
-    # 兜底：页面级 CSS 之外，给所有滚动容器也封死 overscroll（滑动返回
-    # 手势的触发条件）——动态加载的页面/内部滚动区同样覆盖
+    # overscroll-behavior 只设在页面根（html/body）——那里才是滑动返回手势
+    # 的触发入口（页面滚到边缘后的 overscroll）。**不要**用 * 给所有元素设：
+    # 会禁掉内部滚动容器（表格/日志/终端）滚到边缘后的滚动链，表现为
+    # "表格里没法滚动"（实测用户反馈）。
     "s.textContent='::-webkit-scrollbar{width:0;height:0}"
     "::-webkit-scrollbar-thumb{background:transparent}"
     "::-webkit-scrollbar-track{background:transparent}"
     "html{scrollbar-width:none}"
-    "html,body,*{overscroll-behavior:none}';"
+    "html,body{overscroll-behavior:none}';"
     "(document.documentElement||document.head||document.body||document)"
     ".appendChild(s);}"
     "add();document.addEventListener('DOMContentLoaded',add);})()")
