@@ -83,6 +83,10 @@ except Exception:
 # ---------------------------------------------------------------------------
 _PAGE_TMPL = """<!doctype html><html><head><meta charset="utf-8">
 <style>
+ /* 封死滑动返回手势的触发条件：overscroll-behavior 阻止页面到边缘后的
+    过度滚动（Chromium 手势历史导航的入口，合成器层生效） */
+ html,body{{overscroll-behavior:none;overscroll-behavior-x:none;
+           overscroll-behavior-y:none}}
  body{{margin:0;height:100vh;display:flex;flex-direction:column;justify-content:center;
       align-items:center;background:linear-gradient(160deg,#1E6FEB,#0DBD8B);
       color:#fff;font-family:'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}}
@@ -123,10 +127,13 @@ def error_html(message, with_retry_js=False):
 HIDE_SCROLLBAR_JS = (
     "(function(){function add(){if(document.getElementById('__qd_nosb'))return;"
     "var s=document.createElement('style');s.id='__qd_nosb';"
+    # 兜底：页面级 CSS 之外，给所有滚动容器也封死 overscroll（滑动返回
+    # 手势的触发条件）——动态加载的页面/内部滚动区同样覆盖
     "s.textContent='::-webkit-scrollbar{width:0;height:0}"
     "::-webkit-scrollbar-thumb{background:transparent}"
     "::-webkit-scrollbar-track{background:transparent}"
-    "html{scrollbar-width:none}';"
+    "html{scrollbar-width:none}"
+    "html,body,*{overscroll-behavior:none}';"
     "(document.documentElement||document.head||document.body||document)"
     ".appendChild(s);}"
     "add();document.addEventListener('DOMContentLoaded',add);})()")

@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Qoder 用量看板</title>
 <style>
+/* 封死滑动返回手势的触发条件：页面到边缘不再产生 overscroll（Chromium
+   手势历史导航的入口，合成器层生效，触控板/触摸屏通吃） */
+html,body{overscroll-behavior:none;overscroll-behavior-x:none;overscroll-behavior-y:none}
 :root{
   --bg:#f8fafc; --panel:#ffffff; --panel2:#f1f5f9; --panel3:#e2e8f0;
   --line:#e2e8f0; --line-hover:#cbd5e1;
