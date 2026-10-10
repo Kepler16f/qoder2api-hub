@@ -2118,6 +2118,11 @@ async function refreshOne(uid, btn){
 }
 async function testAccount(uid, btn){
   if(btn){ btn.disabled = true; btn.textContent = '测试中...'; }
+  // 遇模型排队时后端会等上游建议的时间（~30s）再自动重测——8 秒还没
+  // 返回就更新按钮文案，避免"没反应"的错觉
+  const hintTimer = setTimeout(() => {
+    if(btn && btn.disabled){ btn.textContent = '仍在测试（排队等待重测中…）'; }
+  }, 8000);
   try{
     const r = await postJSON('/accounts/test', {uid: uid});
     if(r.ok){
@@ -2131,6 +2136,7 @@ async function testAccount(uid, btn){
   }catch(e){
     toast('✗ 测试请求失败: ' + e.message, 'bad');
   }finally{
+    clearTimeout(hintTimer);
     if(btn){ btn.disabled = false; btn.textContent = '测试'; }
   }
 }
