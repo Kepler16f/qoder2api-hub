@@ -37,6 +37,7 @@ import socket
 import ssl
 import sys
 import threading
+import collections
 import fnmatch
 import time
 import urllib.error
@@ -55,6 +56,11 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status, UPSTREAM_OPENER)
 
 
+# 每账号活跃 SSE 流计数：并发分散的依据——open_upstream 成功建流后 +1，
+# record_usage（请求结束的必经路径）后 -1。看板/调用方无需感知。
+_stream_count = collections.Counter()
+
+
 def _flush_dns_cache():
     """清 Windows DNS Client 缓存（负缓存会遮蔽 TUN/代理恢复后的解析）。
 
@@ -71,7 +77,7 @@ from pathlib import Path
 # 上游是 1.2.x/1.3.x semver 号线，日期制天然不撞；桌面发行线是另一套号(1.0.x_R
 # tag)，「检查更新」按它对比本仓库 Releases。历史号（fork 旧 1.2.18-1.2.20、
 # 2026.10.07、2026.10.08）不改写，对应关系见 README 版本线说明。
-VERSION = "2026.10.10.8_re"
+VERSION = "2026.10.10.9_re"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -474,6 +480,12 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     请求档位与实际档位同时落盘，才能看出归一化有没有把它们改掉/丢掉。
     """
     fields = _extract_usage(usage)
+    acc = POOL.get(account) if (account and POOL) else None
+    if acc:
+        # 本账号的 SSE 流结束——递减活跃流计数（并发分散依据）
+        _stream_count[acc.uid] = max(0, _stream_count[acc.uid] - 1)
+        # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
+        acc.credits_dirty = True
     if not fields:
         return None
     row = {
@@ -505,9 +517,6 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
         row["key_id"] = str(key_id)
     acc = POOL.get(account) if (account and POOL) else None
     row["realm"] = acc.realm if acc else CURRENT_REALM
-    if acc:
-        # 本账号刚消耗额度：让 /accounts 的下一次轮询尽快回读 quota
-        acc.credits_dirty = True
     if gen_ms and gen_ms > 0:
         row["tokens_per_sec"] = round(
             fields["completion_tokens"] / (gen_ms / 1000.0), 2)
@@ -4609,6 +4618,16 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
     queue_wait_spent = 0        # 10605 原地等待累计（秒），上限 QUEUE_WAIT_TOTAL_MAX
     overflow_retried = False    # 上游超限后的加压重建重试（只做一次）
 
+    # 并发分散：跳过已有活跃 SSE 流的账号（除非全忙/单号池），
+    # 避免两个并行任务挤同一个上游连接通道
+    if POOL and len(POOL.accounts) > 1:
+        busy = {uid for uid, n in _stream_count.items() if n > 0}
+        if busy and busy != {a.uid for a in POOL.accounts
+                             if a.realm == realm and a.enabled}:
+            tried |= busy       # 把忙的账号加进 exclude，pick 自动跳过
+            log("concurrency spread: skipping %d busy account(s) %s"
+                % (len(busy), [u[:8] for u in busy]), tag="chat")
+
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
     for _ in range(total + 2):
@@ -4657,6 +4676,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None, 
                                              data=encoded.encode("utf-8"),
                                              method="POST", headers=headers)
                 resp = UPSTREAM_OPENER.open(req, timeout=600)
+                _stream_count[account.uid] += 1   # 标记活跃流（并发分散依据）
                 break
             except urllib.error.HTTPError as exc:
                 try:
