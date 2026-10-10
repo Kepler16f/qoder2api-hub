@@ -1749,6 +1749,37 @@ def run_console_shell(state, cfg, config_path, paths, auto_close_ms=None,
     root = tk.Tk()
     root.title("%s 控制台（看板将在浏览器打开）" % APP_TITLE)
     root.minsize(680, 480)
+
+    # 深色模式：与 run_windows_shell 同源（系统检测 + QD_FORCE_DARK 验证钩子）
+    force_dark = (os.environ.get("QD_FORCE_DARK") or "").strip() \
+        in ("1", "true", "yes", "on")
+    dark = force_dark or is_system_dark()
+    if dark:
+        root.config(bg="#0b1220")
+        if sys.platform == "win32":
+            _apply_windows_titlebar_theme(root.winfo_id(), True)
+        style = ttk.Style()
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", background="#0b1220", foreground="#e7eef8",
+                        fieldbackground="#0e1626", bordercolor="#22304d")
+        style.configure("TLabel", background="#0b1220", foreground="#e7eef8")
+        style.configure("TFrame", background="#0b1220")
+        style.configure("TButton", background="#1b2438",
+                        foreground="#e7eef8", activebackground="#31426b")
+        style.configure("TCheckbutton", background="#0b1220",
+                        foreground="#e7eef8", activebackground="#0b1220")
+        style.configure("TSpinbox", fieldbackground="#0e1626",
+                        foreground="#e7eef8", background="#1b2438")
+        style.configure("TEntry", fieldbackground="#0e1626",
+                        foreground="#e7eef8", background="#1b2438")
+        style.map("TButton", background=[("active", "#31426b")])
+        style.map("TCheckbutton",
+                  background=[("active", "#0b1220")],
+                  foreground=[("active", "#e7eef8")])
+
     try:
         for icon in (os.path.join(bundle_dir(), "qoder2api.png"),
                      os.path.join(repo_dir(), "desktop", "assets",
@@ -1761,7 +1792,9 @@ def run_console_shell(state, cfg, config_path, paths, auto_close_ms=None,
 
     status_var = tk.StringVar(value="启动中…")
     status_label = tk.Label(root, textvariable=status_var, anchor="w",
-                            font=("TkDefaultFont", 11, "bold"))
+                            font=("TkDefaultFont", 11, "bold"),
+                            bg="#0b1220" if dark else None,
+                            fg=GREEN)
     status_label.grid(row=0, column=0, sticky="ew", padx=10, pady=6)
     root.columnconfigure(0, weight=1)
     root.rowconfigure(4, weight=1)
@@ -1848,7 +1881,10 @@ def run_console_shell(state, cfg, config_path, paths, auto_close_ms=None,
         .pack(side="left", padx=(8, 0))
 
     log_box = ScrolledText(root, height=12, wrap="word", state="disabled",
-                           font=("TkFixedFont", 9))
+                           font=("TkFixedFont", 9),
+                           bg="#090d16" if dark else None,
+                           fg="#cbd5e1" if dark else None,
+                           insertbackground="#e7eef8" if dark else None)
     log_box.grid(row=4, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
     def on_event(name, payload):
