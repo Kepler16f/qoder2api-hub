@@ -1884,7 +1884,18 @@ async function throwPanelAuthError(r, parsedBody){
 }
 
 async function getJSON(url){
-  const r = await fetch(url, {cache:'no-store', headers: authHeaders()});
+  // 超时保护：挂起的 fetch（代理劫持/连接悬挂）会永久卡住 refresh 的
+  // REFRESH_BUSY 守卫，表现为"看板数据再也不更新"。15 秒未响应即中止，
+  // 让轮询进入失败分支并自然恢复。
+  const ctl = new AbortController();
+  const timer = setTimeout(() => { try{ ctl.abort(); }catch(e){} }, 15000);
+  let r;
+  try {
+    r = await fetch(url, {cache:'no-store', headers: authHeaders(),
+                          signal: ctl.signal});
+  } finally {
+    clearTimeout(timer);
+  }
   await throwPanelAuthError(r);
   if(!r.ok) throw new Error(r.status);
   return r.json();
@@ -2533,10 +2544,17 @@ async function doImportPat(btn){
 
 /* ------------------------------- dashboard ------------------------------ */
 let REFRESH_BUSY = false;
+let REFRESH_STARTED = 0;
 async function refresh(){
   // 5 秒轮询：上一轮尚未返回就跳过本轮，避免请求堆积把服务端拖慢
-  if(REFRESH_BUSY) return;
+  // 看门狗：BUSY 卡死超过 30 秒（fetch 悬挂等极端情况）强制放行本轮，
+  // 防止"永远不再发请求"的静默停摆
+  if(REFRESH_BUSY){
+    if(Date.now() - REFRESH_STARTED < 30000) return;
+    console.warn('[wb] refresh watchdog: releasing stuck BUSY');
+  }
   REFRESH_BUSY = true;
+  REFRESH_STARTED = Date.now();
   try { await refreshInner(); }
   finally { REFRESH_BUSY = false; }
 }
@@ -2904,6 +2922,11 @@ async function submitPanelLogin(){
     if(data.using_default_password){
       toast('当前是默认密码 admin，建议到「设置」里修改', 'warn');
     }
+    // 会话过期后重登：强制重建轮询定时器（startDashboard 有幂等守卫，
+    // PANEL_READY 还是 true 时会直接 return，定时器便停在失效会话上）
+    PANEL_READY = false;
+    PANEL_TIMERS.forEach(t => clearInterval(t));
+    PANEL_TIMERS = [];
     await startDashboard();
   } catch(e) {
     if(msg) msg.textContent = '登录失败: ' + e.message;
