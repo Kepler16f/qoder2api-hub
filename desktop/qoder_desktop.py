@@ -856,7 +856,7 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
 
     def _apply_titlebar():
         """DWM 深色标题栏：窗口完全实现后调用才可靠（winfo_id 需窗口映射）。
-        返回是否成功，失败时日志可见。"""
+        每次调用**重新读取**当前系统主题（用户可能已切换深浅色）。"""
         if sys.platform != "win32":
             return False
         try:
@@ -866,10 +866,12 @@ def run_windows_shell(state, cfg, config_path, paths, auto_close_ms=None,
             if not hwnd:
                 print("[desktop] titlebar: GetAncestor returned NULL")
                 return False
-            ok = _apply_windows_titlebar_theme(hwnd, dark)
+            # 重新检测：不用启动时的 dark 快照（用户可能已切换主题）
+            current_dark = force_dark or is_system_dark()
+            ok = _apply_windows_titlebar_theme(hwnd, current_dark)
             if not ok:
                 print("[desktop] titlebar: DwmSetWindowAttribute failed "
-                      "(hwnd=%s dark=%s)" % (hwnd, dark))
+                      "(hwnd=%s dark=%s)" % (hwnd, current_dark))
             return ok
         except Exception as exc:
             print("[desktop] titlebar theme error: %r" % exc)
